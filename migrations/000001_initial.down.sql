@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS media;
+DROP TABLE IF EXISTS guest_sessions;
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS users;
+DROP TYPE IF EXISTS media_status;
+DROP TYPE IF EXISTS event_status;

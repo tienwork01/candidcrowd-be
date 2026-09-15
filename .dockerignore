@@ -1,0 +1,13 @@
+.git
+.agents
+.env
+.env.*
+!.env.example
+bin
+tmp
+coverage.out
+vendor
+docs
+Dockerfile
+docker-compose*.yml
+README.md

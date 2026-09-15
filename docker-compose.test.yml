@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: candidcrowd
+      POSTGRES_PASSWORD: candidcrowd
+      POSTGRES_DB: candidcrowd_test
+    ports: ["5433:5432"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6380:6379"]
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+    ports: ["4566:4566"]
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports: ["1026:1025", "8026:8025"]
