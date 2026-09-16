@@ -1,0 +1,40 @@
+# Config file for [Air] to hot reload Go in development
+
+root = "."
+testdata_dir = "testdata"
+tmp_dir = "tmp"
+
+[build]
+  # Build the Gin API binary
+  cmd = "go build -o ./tmp/main.exe ./cmd/api"
+  # Binary executable to run
+  bin = "./tmp/main.exe"
+  # Watch files with these extensions
+  include_ext = ["go", "tpl", "tmpl", "html", "env"]
+  # Watch specific files
+  include_file = [".env"]
+  # Ignore these directories
+  exclude_dir = ["assets", "tmp", "vendor", "testdata", "docs", "migrations", ".git"]
+  # Exclude unit tests from triggering reload
+  exclude_regex = ["_test\\.go"]
+  # Delay after file change before rebuilding (ms)
+  delay = 500
+  # Stop running the old binary if build errors occur
+  stop_on_error = true
+  # Send Interrupt signal before killing process (Windows friendly)
+  send_interrupt = true
+  kill_delay = "500ms"
+
+[log]
+  time = false
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  # Delete tmp folder on exit
+  clean_on_exit = true
+

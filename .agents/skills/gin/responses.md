@@ -1,0 +1,499 @@
+# Responses — JSON, XML, Streaming, ProtoBuf
+
+## JSON Response
+
+```go
+// Map-based (quick)
+c.JSON(200, gin.H{
+    "message": "success",
+    "data":    posts,
+})
+
+// Struct-based (recommended for typed responses)
+type Response struct {
+    Success bool        `json:"success"`
+    Data    interface{} `json:"data,omitempty"`
+    Error   string      `json:"error,omitempty"`
+    Meta    *Meta       `json:"meta,omitempty"`
+}
+
+type Meta struct {
+    Page  int `json:"page"`
+    Total int `json:"total"`
+}
+
+c.JSON(200, Response{
+    Success: true,
+    Data:    posts,
+    Meta:    &Meta{Page: 1, Total: 10},
+})
+```
+
+## Error Responses
+
+```go
+// Standard error
+c.JSON(400, gin.H{"error": "invalid request"})
+
+// Validation errors (422)
+c.JSON(422, gin.H{
+    "error":   "validation failed",
+    "details": map[string]string{
+        "email": "must be a valid email",
+        "age":   "must be at least 18",
+    },
+})
+
+// Not found
+c.JSON(404, gin.H{"error": "resource not found"})
+
+// Unauthorized
+c.JSON(401, gin.H{"error": "unauthorized"})
+
+// Internal server error
+c.JSON(500, gin.H{"error": "internal server error"})
+```
+
+## XML Response
+
+```go
+import "encoding/xml"
+
+type Post struct {
+    ID    int    `xml:"id"`
+    Title string `xml:"title"`
+    Body  string `xml:"body"`
+}
+
+c.XML(200, Post{ID: 1, Title: "Hello", Body: "World"})
+```
+
+## YAML Response
+
+```go
+import "gopkg.in/yaml.v3"
+
+c.YAML(200, gin.H{"name": "gin", "version": "1.10"})
+```
+
+## ProtoBuf Response (Gin v1.12+)
+
+```go
+import "google.golang.org/protobuf/proto"
+
+// Define protobuf message (in .proto file, compiled to .pb.go)
+// message Response {
+//   bool success = 1;
+//   string message = 2;
+//   Data data = 3;
+// }
+
+func protobufHandler(c *gin.Context) {
+    // Negotiate ProtoBuf content type based on Accept header
+    // Supports: application/json, application/xml, application/yaml, application/protobuf
+    c.ProtoBuf(200, &Response{
+        Success: true,
+        Message: "hello",
+    })
+}
+
+// Gin v1.12 content negotiation supports:
+// - application/json (default)
+// - application/xml
+// - application/yaml
+// - application/protobuf (NEW)
+```
+
+## HTML Response
+
+```go
+// From file
+c.HTML(200, "index.html", gin.H{"title": "My Site"})
+
+// From string
+c.Data(200, "text/html; charset=utf-8", htmlContent)
+```
+
+## File Download
+
+```go
+// Download file
+c.File("./exports/report.pdf")
+
+// Custom filename
+c.Header("Content-Disposition", "attachment; filename=report.pdf")
+c.File("./exports/report.pdf")
+```
+
+## Streaming Responses
+
+There are two fundamentally different streaming approaches. Know which one you need:
+
+### Server-Sent Events (SSE) — `c.SSEvent()` + `c.Writer.Flush()`
+
+SSE sends formatted events that browsers consume via `EventSource`. Each event has a `data:` prefix. Use this for server-to-client push where browsers handle reconnection automatically.
+
+```go
+// Server-Sent Events — the idiomatic Gin way
+// Set headers, then loop with c.SSEvent() + c.Writer.Flush()
+func sseHandler(c *gin.Context) {
+    c.Writer.Header().Set("Content-Type", "text/event-stream")
+    c.Writer.Header().Set("Cache-Control", "no-cache")
+    c.Writer.Header().Set("Connection", "keep-alive")
+
+    for {
+        select {
+        case <-c.Request.Context().Done():
+            return
+        case msg := <-messages:
+            c.SSEvent("message", msg)
+            c.Writer.Flush()
+        case <-time.After(30 * time.Second):
+            // Keep-alive ping to prevent connection timeout
+            c.SSEvent("ping", time.Now().Unix())
+            c.Writer.Flush()
+        }
+    }
+}
+```
+
+**SSE output format:** `data: {"text":"hello"}\n\n` — Gin's `c.SSEvent()` formats this automatically.
+
+### NDJSON / JSON Lines — `c.Stream()` with `io.Writer` callback
+
+NDJSON streams raw JSON objects, one per line. No SSE formatting — just newline-delimited JSON. Use this for streaming APIs consumed by HTTP clients, CLIs, or parsers that expect JSON lines.
+
+```go
+// NDJSON (Newline-Delimited JSON) — streaming JSON Lines
+// c.Stream() handles chunked transfer-encoding + flushing
+func streamNDJSON(c *gin.Context) {
+    c.Stream(200, "application/x-ndjson")
+    for page := 1; ; page++ {
+        posts, err := db.GetPostsBatchedPage(100, page)
+        if err != nil || len(posts) == 0 {
+            return
+        }
+        for _, post := range posts {
+            b, _ := json.Marshal(post)
+            c.Stream(func(w io.Writer) bool {
+                w.Write(b)
+                w.Write([]byte("\n"))
+                return true // keep streaming
+            })
+        }
+    }
+}
+
+// Streaming plain JSON array (without NDJSON) — write directly to c.Writer
+func streamJSONArray(c *gin.Context) {
+    c.Writer.Header().Set("Content-Type", "application/json")
+    c.Writer.Write([]byte("["))
+    first := true
+    for page := 1; ; page++ {
+        posts, err := db.GetPostsBatchedPage(100, page)
+        if err != nil || len(posts) == 0 {
+            break
+        }
+        for _, post := range posts {
+            if !first {
+                c.Writer.Write([]byte(","))
+            }
+            b, _ := json.Marshal(post)
+            c.Writer.Write(b)
+            first = false
+        }
+        c.Writer.Flush()
+    }
+    c.Writer.Write([]byte("]"))
+}
+```
+
+**NDJSON output format:** `{"id":1,"title":"Hello"}\n{"id":2,"title":"World"}\n` — raw JSON, one object per line.
+
+**Key distinction:**
+- `c.SSEvent()` — sends a formatted SSE message (`data: {...}\n\n`) to `c.Writer`; use it directly in loops with `c.Writer.Flush()`. **Not compatible with `c.Stream()`** — `SSEvent` writes to `c.Writer`, not the `io.Writer` callback passed to `c.Stream()`.
+- `c.Stream()` — handles chunked transfer-encoding; pass it an `io.Writer` callback that writes raw data. **Do not use `c.SSEvent()` inside a `c.Stream()` callback** — they write to different destinations.
+
+**When to use which:**
+- **SSE** (`c.SSEvent`) — browser clients via `EventSource`, auto-reconnection needed, simpler client implementation
+- **NDJSON** (`c.Stream`) — HTTP clients, CLIs, data pipelines, any consumer that parses JSON lines directly
+
+## Custom Renderers via `c.Render()`
+
+For formats Gin does not ship with (CSV, MsgPack, Apache Arrow, protocol buffers from a custom registry, etc.), implement the `render.Render` interface and call `c.Render()`:
+
+```go
+import "github.com/gin-gonic/gin/render"
+
+// MsgPack renderer (binary, faster than JSON for many workloads)
+type MsgPackRender struct {
+    Data interface{}
+}
+
+var msgpack = []byte("msgpack") // content-type suffix used by Render.WriteContentType
+
+func (r MsgPackRender) Render(w http.ResponseWriter) error {
+    r.WriteContentType(w)
+    return msgpackEncode(w, r.Data) // your encoder (e.g. github.com/vmihailenco/msgpack/v5)
+}
+
+func (r MsgPackRender) WriteContentType(w http.ResponseWriter) {
+    w.Header().Set("Content-Type", "application/msgpack")
+}
+
+// Usage in a handler
+func listUsers(c *gin.Context) {
+    users, err := db.GetUsers(c.Request.Context())
+    if err != nil {
+        c.JSON(500, gin.H{"error": err.Error()})
+        return
+    }
+    c.Render(200, MsgPackRender{Data: users})
+}
+```
+
+**Content-negotiated handler that picks the renderer at runtime:**
+
+```go
+func listUsers(c *gin.Context) {
+    users, err := db.GetUsers(c.Request.Context())
+    if err != nil {
+        c.JSON(500, gin.H{"error": err.Error()})
+        return
+    }
+
+    switch c.GetHeader("Accept") {
+    case "application/msgpack":
+        c.Render(200, MsgPackRender{Data: users})
+    case "application/x-protobuf":
+        c.Render(200, render.ProtoBuf{Data: users})
+    default:
+        c.JSON(200, users)
+    }
+}
+```
+
+**Implementing a CSV renderer:**
+
+```go
+import (
+    "encoding/csv"
+    "github.com/gin-gonic/gin/render"
+)
+
+type CSVRender struct {
+    Headers []string
+    Rows    [][]string
+}
+
+func (r CSVRender) Render(w http.ResponseWriter) error {
+    r.WriteContentType(w)
+    cw := csv.NewWriter(w)
+    if len(r.Headers) > 0 {
+        if err := cw.Write(r.Headers); err != nil {
+            return err
+        }
+    }
+    return cw.WriteAll(r.Rows)
+}
+
+func (r CSVRender) WriteContentType(w http.ResponseWriter) {
+    w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+    w.Header().Set("Content-Disposition", `attachment; filename="export.csv"`)
+}
+
+// Usage
+func exportUsers(c *gin.Context) {
+    users, _ := db.GetUsers(c.Request.Context())
+    rows := make([][]string, 0, len(users))
+    for _, u := range users {
+        rows = append(rows, []string{u.ID, u.Email, u.Name})
+    }
+    c.Render(200, CSVRender{
+        Headers: []string{"id", "email", "name"},
+        Rows:    rows,
+    })
+}
+```
+
+**Key rules for custom renderers:**
+- `Render(w)` must call `WriteContentType(w)` first — Gin checks the header was set
+- Errors from `Render` are propagated to the error logger; return meaningful errors
+- Use `c.Status(code)` before `c.Render(code, ...)` is redundant — pass the code to `Render`
+- For streaming, write directly to `c.Writer` and call `c.Writer.Flush()` — `c.Render` is for fixed-size payloads
+
+
+## JSON v2 Custom Renderer (Go 1.27+, opt-in)
+
+Gin's built-in `c.JSON()` uses `encoding/json` v1. On Go 1.27+ you can swap in `encoding/json/v2` for **2.7–10.2× faster unmarshaling** and **~1.8× faster marshaling on typical payloads** by registering a custom renderer. v1 is **not deprecated** — both packages coexist.
+
+> **Go 1.27+ default:** `encoding/json` v1 is now **backed by the v2 implementation** internally, so existing handlers using `c.JSON()` / `c.ShouldBindJSON()` get the v2 performance automatically — no code change required. Registering a custom `JSONV2Render` (below) is only needed if you want explicit v2 control (options, streaming, stricter behavior).
+
+```go
+import (
+    jsonv2 "encoding/json/v2"
+    "github.com/gin-gonic/gin/render"
+)
+
+// JSONV2Render uses encoding/json/v2 with stricter defaults (rejects invalid UTF-8, duplicate keys)
+type JSONV2Render struct {
+    Data any
+    Opts []jsonv2.Options // variadic: jsonv2.OMitZero, jsonv2.FormatNilSliceAsNull, etc.
+}
+
+func (r JSONV2Render) Render(w http.ResponseWriter) error {
+    r.WriteContentType(w)
+    return jsonv2.MarshalWrite(w, r.Data, r.Opts...)
+}
+
+func (r JSONV2Render) WriteContentType(w http.ResponseWriter) {
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+}
+
+// Handler — swap c.JSON() for c.Render(200, JSONV2Render{...})
+func listUsers(c *gin.Context) {
+    users, err := db.GetUsers(c.Request.Context())
+    if err != nil {
+        c.JSON(500, gin.H{"error": err.Error()}) // v1 is fine for errors
+        return
+    }
+    c.Render(200, JSONV2Render{Data: users})
+}
+```
+
+**Why v2 matters for Gin apps:**
+- **Decode speed** — `jsonv2.Unmarshal` is 2.7–10.2× faster than v1 on typical JSON (2.7× small payloads, 10.2× large/structured). Hot path for high-RPS APIs.
+- **Streaming custom types** — `MarshalJSONTo` / `UnmarshalJSONFrom` convert O(n²) unmarshaling into O(n) for large/complex payloads. The k8s OpenAPI spec went **40× faster** by switching to `UnmarshalJSONFrom`.
+- **Stricter defaults** — v2 rejects invalid UTF-8 strings and duplicate JSON object keys. Good for API correctness/security; bad if you consume legacy clients sending duplicates.
+- **Variadic options** — `jsonv2.OMitZero`, `jsonv2.FormatNilSliceAsNull`, `jsonv2.DiscardUnknownMembers`, `jsonv2.RejectDuplicateMembers` configure behavior per-call without struct tags.
+
+**Activation:** v2 ships in Go 1.27 (release freeze May 20, 2026; final ~August 2026). On Go 1.24/1.25/1.26 you can use the **opt-in experiment**: `GOEXPERIMENT=jsonv2 go build`. See [Go 1.27 release notes](https://go.dev/doc/go1.27) and [`github.com/go-json-experiment/json`](https://github.com/go-json-experiment/json) for the pre-1.27 backport.
+
+**v2 `omitempty` behavior change** (heads-up): v2's `omitempty` is based on **JSON emptiness**, not Go zero values. A non-pointer struct field with all zero values is omitted only if it marshals to `{}`. Pointer fields with `nil` are still omitted. Test your existing structs.
+
+```go
+type Box struct{}                          // marshals to {}
+type Demo struct{ B Box `json:",omitempty"` }
+demo := Demo{}
+// v1: {"B":{}}    (struct is never "empty" to v1)
+// v2: {}           (v2 omits because {} is JSON-empty)
+```
+
+**Content negotiation with v2** — combine the v2 renderer with `Accept` header logic to opt-in per route, or swap `gin.Default()` JSON globally via a custom `Engine`:
+
+```go
+// Global swap: replace Gin's default JSON renderer
+// (advanced — affects every c.JSON() in the app)
+r := gin.New()
+r.JSON = func(c *gin.Context, code int, obj any) {
+    c.Render(code, JSONV2Render{Data: obj})
+}
+```
+
+
+## Redirects
+```go
+// Temporary redirect (302)
+c.Redirect(302, "/new-url")
+
+// Permanent redirect (301)
+c.Redirect(301, "/new-url")
+
+// Route redirect
+c.Redirect(302, r.GetRoute("posts").Path)
+```
+
+## Content Negotiation
+
+```go
+// Respond with format based on Accept header
+// Gin v1.12+ supports: json, xml, yaml, protobuf
+func respond(c *gin.Context) {
+    content := gin.H{"message": "hello"}
+    c.Negotiate(content) // uses Accept header to pick format
+}
+
+// Manual override
+switch c.GetHeader("Accept") {
+case "application/xml":
+    c.XML(200, content)
+case "application/yaml":
+    c.YAML(200, content)
+case "application/protobuf":
+    c.ProtoBuf(200, content)
+default:
+    c.JSON(200, content)
+}
+```
+
+## Pagination Response Pattern
+
+```go
+type PaginatedResponse struct {
+    Success bool        `json:"success"`
+    Data    interface{} `json:"data"`
+    Meta    struct {
+        Page       int `json:"page"`
+        PerPage    int `json:"per_page"`
+        Total      int `json:"total"`
+        LastPage   int `json:"last_page"`
+    } `json:"meta"`
+}
+
+func paginatedResponse(c *gin.Context, data interface{}, page, perPage, total int) {
+    c.JSON(200, PaginatedResponse{
+        Success: true,
+        Data:    data,
+        Meta: struct {
+            Page     int `json:"page"`
+            PerPage  int `json:"per_page"`
+            Total    int `json:"total"`
+            LastPage int `json:"last_page"`
+        }{
+            Page:     page,
+            PerPage:  perPage,
+            Total:    total,
+            LastPage: (total + perPage - 1) / perPage,
+        },
+    })
+}
+```
+
+## Common Mistakes
+
+1. **Returning after `c.JSON()`** — while Gin technically handles this, always return for clarity
+2. **Wrong content type for streaming** — set headers before streaming
+3. **Not handling context cancellation in streams** — check `c.Request.Context().Done()`
+4. **Using `gin.H{}` for everything** — struct types give you compile-time safety
+5. **Not using ProtoBuf for high-performance gRPC integration** — Gin v1.12+ supports it natively via content negotiation
+6. **Using `c.SSEvent()` inside a `c.Stream()` callback** — `SSEvent` writes to `c.Writer`, not the callback's `io.Writer` parameter — they are incompatible; `c.SSEvent` must be called directly in the loop
+7. **No keep-alive ping in SSE** — long-lived SSE connections may be closed by proxies if no data flows for ~60s; send a periodic `ping` event
+8. **Confusing SSE with NDJSON** — SSE adds `data:` prefix formatting; NDJSON is raw JSON lines; choose based on your client
+
+
+## Updated from Research (2026-06-18)
+
+### Custom Renderers via c.Render()
+- Implement `render.Render` interface: `Render(w http.ResponseWriter) error` + `WriteContentType(w http.ResponseWriter)`
+- `Render(w)` must call `WriteContentType(w)` first — Gin checks the Content-Type was set
+- Use `c.Render(code, myRenderer{...})` — pass the HTTP status code to `Render`, not `c.Status()` first
+- For streaming/chunked output, write directly to `c.Writer` + `c.Writer.Flush()` instead
+- Good fits: CSV, MsgPack, Apache Arrow, custom protobuf registries, Thrift, custom binary formats
+
+### Sources
+- https://pkg.go.dev/github.com/gin-gonic/gin/render (Gin render package)
+- https://github.com/gin-gonic/gin/blob/master/render/render.go (interface definition)
+
+### JSON v2 Custom Renderer (Go 1.27)
+- Built-in `c.JSON()` still uses `encoding/json` v1 — opt into v2 via a custom `render.Render` impl
+- **Decode: 2.7–10.2× faster** than v1; k8s OpenAPI spec went **~40× faster** with `UnmarshalJSONFrom`
+- **Encode: ~1.8× faster** on typical payloads (varies by shape — benchmark yours)
+- Stricter defaults: rejects invalid UTF-8 strings + duplicate JSON object keys
+- Use `jsonv2.OMitZero` option (or `omitzero` struct tag) for v2's JSON-emptiness semantics
+- Pre-1.27: use `GOEXPERIMENT=jsonv2` or import `github.com/go-json-experiment/json`
+
+### Sources
+- https://go.dev/doc/go1.27 (Go 1.27 release notes)
+- https://antonz.org/go-json-v2/ (v1→v2 evolution, performance details)
+- https://github.com/go-json-experiment/json (pre-1.27 backport)
+- https://github.com/go-json-experiment/jsonbench (benchmarks)

@@ -1,7 +1,8 @@
 APP := candidcrowd-api
 MIGRATE := migrate -path migrations -database "$(DATABASE_URL)"
 
-.PHONY: run build test test-integration lint fmt vet docker-up docker-down migrate-up migrate-down migrate-create
+.PHONY: dev run build test test-integration lint fmt vet docker-up docker-down migrate-up migrate-down migrate-create
+dev: ; air
 run: ; go run ./cmd/api
 build: ; go build -o bin/$(APP) ./cmd/api
 test: ; go test ./...

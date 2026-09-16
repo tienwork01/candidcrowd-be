@@ -49,6 +49,7 @@ func TestCORSMiddleware(t *testing.T) {
 		require.Equal(t, "http://localhost:3000", res.Header().Get("Access-Control-Allow-Origin"))
 		require.Equal(t, "Origin", res.Header().Get("Vary"))
 		require.Contains(t, res.Header().Get("Access-Control-Allow-Headers"), "Authorization")
+		require.Contains(t, res.Header().Get("Access-Control-Expose-Headers"), "X-Request-ID")
 		require.Contains(t, res.Header().Get("Access-Control-Allow-Methods"), "GET, POST")
 	})
 

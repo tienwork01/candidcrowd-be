@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "Gin": {
+      "source": "clawvpsai/gin-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "eff31d986cf60ba078c13d6cbe9b509734f8be650fb5d27f10e2b2626b464282"
+    },
     "golang-naming": {
       "source": "samber/cc-skills-golang",
       "sourceType": "github",
