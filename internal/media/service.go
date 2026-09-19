@@ -9,24 +9,37 @@ import (
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
-	"github.com/candidcrowd/candidcrowd-backend/internal/platform/r2"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+type ObjectInfo struct {
+	Size        int64
+	ContentType string
+}
+
+type Storage interface {
+	PresignPut(ctx context.Context, key, mime string, expiry time.Duration) (string, error)
+	PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error)
+	Head(ctx context.Context, key string) (ObjectInfo, error)
+	Delete(ctx context.Context, key string) error
+}
 
 type Limiter interface {
 	Allow(context.Context, string, int, time.Duration) (bool, error)
 }
+
 type Service struct {
 	db                 *gorm.DB
-	storage            r2.Storage
+	storage            Storage
 	limiter            Limiter
 	expiry, window     time.Duration
 	rate               int
 	maxImage, maxVideo int64
 }
 
-func NewService(db *gorm.DB, storage r2.Storage, limiter Limiter, expiry, window time.Duration, rate int, maxImage, maxVideo int64) *Service {
+func NewService(db *gorm.DB, storage Storage, limiter Limiter, expiry, window time.Duration, rate int, maxImage, maxVideo int64) *Service {
 	return &Service{db, storage, limiter, expiry, window, rate, maxImage, maxVideo}
 }
 
@@ -45,7 +58,7 @@ func (s *Service) CreateUpload(ctx context.Context, e event.Event, session guest
 	if e.Status != event.StatusActive {
 		return UploadTarget{}, fmt.Errorf("event is not accepting uploads")
 	}
-	if in.Size <= 0 || !allowed(in.MIMEType) || in.Size > limit(in.MIMEType, s.maxImage, s.maxVideo) {
+	if in.Size <= 0 || !allowed(in.MIMEType) || in.Size > limitByMIME(in.MIMEType, s.maxImage, s.maxVideo) {
 		return UploadTarget{}, fmt.Errorf("invalid media type or file size")
 	}
 	ok, err := s.limiter.Allow(ctx, "upload:"+session.ID.String(), s.rate, s.window)
@@ -59,12 +72,12 @@ func (s *Service) CreateUpload(ctx context.Context, e event.Event, session guest
 	m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", e.ID, m.ID, extension(in.MIMEType))
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var locked event.Event
-		if e := tx.Set("gorm:query_option", "FOR UPDATE").First(&locked, "id = ?", e.ID).Error; e != nil {
-			return e
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, "id = ?", e.ID).Error; err != nil {
+			return err
 		}
 		var reserved int64
-		if e := tx.Model(&Media{}).Where("event_id = ? AND status = ?", e.ID, StatusPending).Select("COALESCE(SUM(expected_size), 0)").Scan(&reserved).Error; e != nil {
-			return e
+		if err := tx.Model(&Media{}).Where("event_id = ? AND status = ?", e.ID, StatusPending).Select("COALESCE(SUM(expected_size), 0)").Scan(&reserved).Error; err != nil {
+			return err
 		}
 		if locked.UsedMediaBytes+reserved+in.Size > locked.MaxMediaBytes {
 			return fmt.Errorf("event storage quota exceeded")
@@ -81,7 +94,11 @@ func (s *Service) CreateUpload(ctx context.Context, e event.Event, session guest
 	}
 	return UploadTarget{m.ID, url, time.Now().Add(s.expiry)}, nil
 }
+
 func (s *Service) Complete(ctx context.Context, e event.Event, session guest.Session, mediaID uuid.UUID) error {
+	if e.Status != event.StatusActive {
+		return fmt.Errorf("event is not accepting uploads")
+	}
 	var m Media
 	if err := s.db.WithContext(ctx).Where("id = ? AND event_id = ? AND guest_session_id = ? AND status = ?", mediaID, e.ID, session.ID, StatusPending).First(&m).Error; err != nil {
 		return err
@@ -105,26 +122,27 @@ func (s *Service) Complete(ctx context.Context, e event.Event, session guest.Ses
 		return tx.Model(&event.Event{}).Where("id = ?", e.ID).UpdateColumn("used_media_bytes", gorm.Expr("used_media_bytes + ?", obj.Size)).Error
 	})
 }
-func allowed(m string) bool { return strings.HasPrefix(m, "image/") || strings.HasPrefix(m, "video/") }
-func limit(m string, i, v int64) int64 {
-	if strings.HasPrefix(m, "image/") {
-		return i
-	}
-	return v
+
+var supportedMIMETypes = map[string]string{
+	"image/jpeg":      ".jpg",
+	"image/png":       ".png",
+	"image/webp":      ".webp",
+	"video/mp4":       ".mp4",
+	"video/quicktime": ".mov",
 }
-func extension(m string) string {
-	switch m {
-	case "image/jpeg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/webp":
-		return ".webp"
-	case "video/mp4":
-		return ".mp4"
-	case "video/quicktime":
-		return ".mov"
-	default:
-		return ""
+
+func allowed(mimeType string) bool {
+	_, ok := supportedMIMETypes[mimeType]
+	return ok
+}
+
+func limitByMIME(mimeType string, maxImageBytes, maxVideoBytes int64) int64 {
+	if strings.HasPrefix(mimeType, "image/") {
+		return maxImageBytes
 	}
+	return maxVideoBytes
+}
+
+func extension(mimeType string) string {
+	return supportedMIMETypes[mimeType]
 }

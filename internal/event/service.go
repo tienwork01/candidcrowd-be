@@ -3,20 +3,21 @@ package event
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
-	"github.com/candidcrowd/candidcrowd-backend/internal/user"
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type Service struct {
-	db            *gorm.DB
+	repo          Repository
 	eventMaxBytes int64
 }
 
-func NewService(db *gorm.DB, eventMaxBytes int64) *Service { return &Service{db, eventMaxBytes} }
+func NewService(repo Repository, eventMaxBytes int64) *Service {
+	return &Service{repo: repo, eventMaxBytes: eventMaxBytes}
+}
 
 type CreateInput struct {
 	Name, EventType    string
@@ -24,47 +25,101 @@ type CreateInput struct {
 	ExpectedGuestCount int
 }
 
-func (s *Service) Create(ctx context.Context, externalID, email string, in CreateInput) (Event, error) {
+type ListInput struct {
+	Page      int
+	PerPage   int
+	Query     string
+	EventType string
+	Sort      string
+}
+
+type ListOutput struct {
+	Events     []Event
+	Pagination Pagination
+}
+
+func (s *Service) Create(ctx context.Context, hostID uuid.UUID, in CreateInput) (Event, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		return Event{}, fmt.Errorf("event name is required")
 	}
 	if in.ExpectedGuestCount < 0 {
 		return Event{}, fmt.Errorf("expected guest count cannot be negative")
 	}
-	var u user.User
-	err := s.db.WithContext(ctx).Where("better_auth_user_id = ?", externalID).FirstOrCreate(&u, user.User{BetterAuthUserID: externalID, Email: email}).Error
-	if err != nil {
+	evt := Event{
+		HostID:             hostID,
+		Name:               strings.TrimSpace(in.Name),
+		Slug:               slug(),
+		EventDate:          in.EventDate,
+		EventType:          defaultType(in.EventType),
+		ExpectedGuestCount: in.ExpectedGuestCount,
+		Status:             StatusActive,
+		GalleryEnabled:     true,
+		MaxMediaBytes:      s.eventMaxBytes,
+	}
+	if err := s.repo.Create(ctx, &evt); err != nil {
 		return Event{}, err
 	}
-	e := Event{HostID: u.ID, Name: strings.TrimSpace(in.Name), Slug: slug(), EventDate: in.EventDate, EventType: defaultType(in.EventType), ExpectedGuestCount: in.ExpectedGuestCount, Status: StatusActive, GalleryEnabled: true, MaxMediaBytes: s.eventMaxBytes}
-	return e, s.db.WithContext(ctx).Create(&e).Error
+	return evt, nil
 }
-func (s *Service) List(ctx context.Context, externalID string) ([]Event, error) {
-	var u user.User
-	if e := s.db.WithContext(ctx).Where("better_auth_user_id = ?", externalID).First(&u).Error; e != nil {
-		if e == gorm.ErrRecordNotFound {
-			return []Event{}, nil
-		}
-		return nil, e
+
+func (s *Service) List(ctx context.Context, hostID uuid.UUID, in ListInput) (ListOutput, error) {
+	page := in.Page
+	if page < 1 {
+		page = 1
 	}
-	var events []Event
-	e := s.db.WithContext(ctx).Where("host_id = ?", u.ID).Order("created_at desc").Find(&events).Error
-	return events, e
+	perPage := in.PerPage
+	if perPage < 1 {
+		perPage = 12
+	} else if perPage > 100 {
+		perPage = 100
+	}
+
+	filter := ListFilter{
+		Page:      page,
+		PerPage:   perPage,
+		Query:     strings.TrimSpace(in.Query),
+		EventType: strings.TrimSpace(in.EventType),
+		Sort:      strings.TrimSpace(in.Sort),
+	}
+
+	events, total, err := s.repo.ListByHost(ctx, hostID, filter)
+	if err != nil {
+		return ListOutput{}, err
+	}
+
+	totalPages := 1
+	if total > 0 {
+		totalPages = int(math.Ceil(float64(total) / float64(perPage)))
+	}
+
+	pagination := Pagination{
+		Page:       page,
+		PerPage:    perPage,
+		Total:      total,
+		TotalPages: totalPages,
+		HasNext:    page < totalPages,
+		HasPrev:    page > 1,
+	}
+
+	return ListOutput{
+		Events:     events,
+		Pagination: pagination,
+	}, nil
 }
-func (s *Service) GetOwned(ctx context.Context, id uuid.UUID, externalID string) (Event, error) {
-	var e Event
-	err := s.db.WithContext(ctx).Joins("JOIN users ON users.id = events.host_id").Where("events.id = ? AND users.better_auth_user_id = ?", id, externalID).First(&e).Error
-	return e, err
+
+func (s *Service) GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, error) {
+	return s.repo.GetOwned(ctx, id, hostID)
 }
+
 func (s *Service) GetPublic(ctx context.Context, slug string) (Event, error) {
-	var e Event
-	err := s.db.WithContext(ctx).Where("slug = ? AND status = ?", slug, StatusActive).First(&e).Error
-	return e, err
+	return s.repo.GetPublic(ctx, slug)
 }
-func defaultType(v string) string {
-	if strings.TrimSpace(v) == "" {
+
+func defaultType(eventType string) string {
+	if strings.TrimSpace(eventType) == "" {
 		return "other"
 	}
-	return strings.TrimSpace(v)
+	return strings.TrimSpace(eventType)
 }
+
 func slug() string { return "evt_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12] }

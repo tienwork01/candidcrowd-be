@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
@@ -18,26 +19,32 @@ type PublicHandler struct {
 	media  *media.Service
 }
 
-func NewPublicHandler(e *event.Service, g *guest.Service, m *media.Service) *PublicHandler {
-	return &PublicHandler{e, g, m}
+func NewPublicHandler(events *event.Service, guests *guest.Service, media *media.Service) *PublicHandler {
+	return &PublicHandler{events: events, guests: guests, media: media}
 }
 
 func (h *PublicHandler) Event(c *gin.Context) {
-	e, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
+	evt, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"id": e.ID, "name": e.Name, "slug": e.Slug, "event_date": e.EventDate, "gallery_enabled": e.GalleryEnabled})
+	c.JSON(http.StatusOK, gin.H{
+		"id":              evt.ID,
+		"name":            evt.Name,
+		"slug":            evt.Slug,
+		"event_date":      evt.EventDate,
+		"gallery_enabled": evt.GalleryEnabled,
+	})
 }
 
 func (h *PublicHandler) CreateSession(c *gin.Context) {
-	e, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
+	evt, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		return
 	}
-	_, token, err := h.guests.Create(c.Request.Context(), e.ID)
+	_, token, err := h.guests.Create(c.Request.Context(), evt.ID)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
@@ -58,17 +65,22 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", err.Error()))
 		return
 	}
-	e, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
+	evt, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		return
 	}
-	session, err := h.guests.Validate(c.Request.Context(), e.ID, req.GuestSessionToken)
+	session, err := h.guests.Validate(c.Request.Context(), evt.ID, req.GuestSessionToken)
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusUnauthorized, "invalid_guest_session", "guest session is invalid or expired"))
 		return
 	}
-	target, err := h.media.CreateUpload(c.Request.Context(), e, session, media.CreateInput{Filename: req.Filename, MIMEType: req.MIMEType, Size: req.Size, SessionToken: req.GuestSessionToken})
+	target, err := h.media.CreateUpload(c.Request.Context(), evt, session, media.CreateInput{
+		Filename:     req.Filename,
+		MIMEType:     req.MIMEType,
+		Size:         req.Size,
+		SessionToken: req.GuestSessionToken,
+	})
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_not_allowed", err.Error()))
 		return
@@ -91,18 +103,18 @@ func (h *PublicHandler) Complete(c *gin.Context) {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "upload id must be a UUID"))
 		return
 	}
-	e, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
+	evt, err := h.events.GetPublic(c.Request.Context(), c.Param("slug"))
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		return
 	}
-	session, err := h.guests.Validate(c.Request.Context(), e.ID, req.GuestSessionToken)
+	session, err := h.guests.Validate(c.Request.Context(), evt.ID, req.GuestSessionToken)
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusUnauthorized, "invalid_guest_session", "guest session is invalid or expired"))
 		return
 	}
-	if err = h.media.Complete(c.Request.Context(), e, session, id); err != nil {
-		if err == gorm.ErrRecordNotFound {
+	if err = h.media.Complete(c.Request.Context(), evt, session, id); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "upload not found"))
 		} else {
 			apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_verification_failed", err.Error()))

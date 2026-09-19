@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
@@ -43,7 +44,7 @@ func (h *Handler) Accept(c *gin.Context) {
 		return
 	}
 	view, err := h.service.Accept(c.Request.Context(), identity, request.TermsVersion, request.PrivacyVersion)
-	if err == ErrInvalidConsent {
+	if errors.Is(err, ErrInvalidConsent) {
 		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "invalid_consent_version", "consent document version is invalid"))
 		return
 	}

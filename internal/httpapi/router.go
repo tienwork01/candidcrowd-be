@@ -10,25 +10,36 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
-	redispkg "github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
+	"github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
-func NewRouter(logger *slog.Logger, authn *auth.Verifier, limiter *redispkg.Limiter, allowedOrigins []string, databaseReady func(context.Context) error, profiles *profile.Handler, events *event.Handler, public *PublicHandler) *gin.Engine {
+type RouterConfig struct {
+	Logger         *slog.Logger
+	Auth           *auth.Verifier
+	Limiter        *redis.Limiter
+	AllowedOrigins []string
+	DatabaseReady  func(context.Context) error
+	Profiles       *profile.Handler
+	Events         *event.Handler
+	Public         *PublicHandler
+}
+
+func NewRouter(cfg RouterConfig) *gin.Engine {
 	r := gin.New()
-	r.Use(recovery(logger), requestID(), requestLog(logger), cors.Middleware(allowedOrigins))
+	r.Use(recovery(cfg.Logger), requestID(), requestLog(cfg.Logger), cors.Middleware(cfg.AllowedOrigins))
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.GET("/readyz", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		if err := databaseReady(ctx); err != nil {
+		if err := cfg.DatabaseReady(ctx); err != nil {
 			apierror.Respond(c, apierror.New(http.StatusServiceUnavailable, "not_ready", "database unavailable"))
 			return
 		}
-		if err := limiter.Ping(ctx); err != nil {
+		if err := cfg.Limiter.Ping(ctx); err != nil {
 			apierror.Respond(c, apierror.New(http.StatusServiceUnavailable, "not_ready", "redis unavailable"))
 			return
 		}
@@ -36,20 +47,20 @@ func NewRouter(logger *slog.Logger, authn *auth.Verifier, limiter *redispkg.Limi
 	})
 
 	api := r.Group("/api/v1")
-	me := api.Group("/me", authn.Middleware())
-	me.GET("", profiles.Me)
-	me.POST("/consents", profiles.Accept)
+	me := api.Group("/me", cfg.Auth.Middleware())
+	me.GET("", cfg.Profiles.Me)
+	me.POST("/consents", cfg.Profiles.Accept)
 
-	host := api.Group("/events", authn.Middleware())
-	host.POST("", events.Create)
-	host.GET("", events.List)
-	host.GET("/:id", events.Get)
+	host := api.Group("/events", cfg.Auth.Middleware())
+	host.POST("", cfg.Events.Create)
+	host.GET("", cfg.Events.List)
+	host.GET("/:id", cfg.Events.Get)
 
 	pub := api.Group("/public/events/:slug")
-	pub.GET("", public.Event)
-	pub.POST("/sessions", public.CreateSession)
-	pub.POST("/uploads", public.CreateUpload)
-	pub.POST("/uploads/:uploadId/complete", public.Complete)
+	pub.GET("", cfg.Public.Event)
+	pub.POST("/sessions", cfg.Public.CreateSession)
+	pub.POST("/uploads", cfg.Public.CreateUpload)
+	pub.POST("/uploads/:uploadId/complete", cfg.Public.Complete)
 
 	return r
 }

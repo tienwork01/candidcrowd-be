@@ -12,6 +12,7 @@ import (
 
 type Config struct {
 	// App
+	AppName  string
 	Env      string
 	HTTPAddr string
 	LogLevel string
@@ -91,6 +92,7 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
+		AppName:  str("APP_NAME", "CandidCrowd"),
 		Env:      str("APP_ENV", "development"),
 		HTTPAddr: str("HTTP_ADDR", ":8080"),
 		LogLevel: str("LOG_LEVEL", "info"),

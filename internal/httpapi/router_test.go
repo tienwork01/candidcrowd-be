@@ -16,7 +16,10 @@ func TestRouter_RequestID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-	r := NewRouter(logger, nil, nil, nil, func(context.Context) error { return nil }, nil, nil, nil)
+	r := NewRouter(RouterConfig{
+		Logger:        logger,
+		DatabaseReady: func(context.Context) error { return nil },
+	})
 
 	t.Run("generates request ID when missing", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)

@@ -16,10 +16,10 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/httpapi"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
-	platformcors "github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
+	"github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/database"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/r2"
-	redispkg "github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
+	"github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
 )
@@ -30,6 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 }
+
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -48,7 +49,7 @@ func run() error {
 			logger.Error("close database", "error", closeErr)
 		}
 	}()
-	limiter, err := redispkg.Open(cfg.RedisURL)
+	limiter, err := redis.Open(cfg.RedisURL)
 	if err != nil {
 		return err
 	}
@@ -66,17 +67,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	events := event.NewService(db, cfg.EventMaxBytes)
-	profiles := profile.NewService(db, cfg.TermsVersion, cfg.PrivacyVersion)
+	events := event.NewService(event.NewGormRepository(db), cfg.EventMaxBytes)
+	profiles := profile.NewService(profile.NewGormRepository(db), cfg.TermsVersion, cfg.PrivacyVersion)
 	eventHandler := event.NewHandler(events, profiles)
-	guests := guest.NewService(db, 24*time.Hour)
+	guests := guest.NewService(guest.NewGormRepository(db), 24*time.Hour)
 	uploads := media.NewService(db, storage, limiter, cfg.PresignExpiry, cfg.RateWindow, cfg.UploadRateLimit, cfg.MaxImageBytes, cfg.MaxVideoBytes)
-	router := httpapi.NewRouter(logger, authn, limiter, platformcors.Origins(cfg.CORSAllowedOrigins), sqlDB.PingContext, profile.NewHandler(profiles), eventHandler, httpapi.NewPublicHandler(events, guests, uploads))
+	router := httpapi.NewRouter(httpapi.RouterConfig{
+		Logger:         logger,
+		Auth:           authn,
+		Limiter:        limiter,
+		AllowedOrigins: cors.Origins(cfg.CORSAllowedOrigins),
+		DatabaseReady:  sqlDB.PingContext,
+		Profiles:       profile.NewHandler(profiles),
+		Events:         eventHandler,
+		Public:         httpapi.NewPublicHandler(events, guests, uploads),
+	})
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		logger.Info("http server started", "addr", cfg.HTTPAddr)
-		if e := server.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
-			logger.Error("http server failed", "error", e)
+		if serverErr := server.ListenAndServe(); serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			logger.Error("http server failed", "error", serverErr)
 		}
 	}()
 	stop := make(chan os.Signal, 1)
@@ -86,14 +96,14 @@ func run() error {
 	defer cancel()
 	return server.Shutdown(shutdown)
 }
-func level(v string) slog.Level {
-	if v == "debug" {
+func level(levelStr string) slog.Level {
+	if levelStr == "debug" {
 		return slog.LevelDebug
 	}
-	if v == "warn" {
+	if levelStr == "warn" {
 		return slog.LevelWarn
 	}
-	if v == "error" {
+	if levelStr == "error" {
 		return slog.LevelError
 	}
 	return slog.LevelInfo

@@ -1,6 +1,7 @@
 package event
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -29,57 +30,102 @@ type createRequest struct {
 
 func (h *Handler) Create(c *gin.Context) {
 	var req createRequest
-	if e := c.ShouldBindJSON(&req); e != nil {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", e.Error()))
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", err.Error()))
 		return
 	}
-	i, e := auth.Get(c)
-	if e != nil {
-		apierror.Respond(c, e)
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
 		return
 	}
-	if e = h.profiles.RequireEventCreation(c.Request.Context(), i); e != nil {
-		switch e {
-		case profile.ErrEmailUnverified:
+	view, err := h.profiles.RequireEventCreation(c.Request.Context(), identity)
+	if err != nil {
+		if errors.Is(err, profile.ErrEmailUnverified) {
 			apierror.Respond(c, apierror.New(http.StatusForbidden, "email_unverified", "verify your email before creating an event"))
-		case profile.ErrConsentRequired:
-			apierror.Respond(c, apierror.New(http.StatusForbidden, "consent_required", "accept the current terms and privacy policy"))
-		default:
-			apierror.Respond(c, e)
+			return
 		}
+		if errors.Is(err, profile.ErrConsentRequired) {
+			apierror.Respond(c, apierror.New(http.StatusForbidden, "consent_required", "accept the current terms and privacy policy"))
+			return
+		}
+		apierror.Respond(c, err)
 		return
 	}
-	out, e := h.service.Create(c.Request.Context(), i.BetterAuthUserID, i.Email, CreateInput(req))
-	if e != nil {
-		apierror.Respond(c, e)
+	created, err := h.service.Create(c.Request.Context(), view.ID, CreateInput{
+		Name:               req.Name,
+		EventType:          req.EventType,
+		EventDate:          req.EventDate,
+		ExpectedGuestCount: req.ExpectedGuestCount,
+	})
+	if err != nil {
+		apierror.Respond(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, out)
+	c.JSON(http.StatusCreated, created)
 }
+
+type listQuery struct {
+	Page      int    `form:"page" binding:"omitempty,min=1"`
+	PerPage   int    `form:"per_page" binding:"omitempty,min=1,max=100"`
+	Query     string `form:"q" binding:"omitempty,max=100"`
+	EventType string `form:"type" binding:"omitempty,max=80"`
+	Sort      string `form:"sort" binding:"omitempty,oneof=newest oldest name upcoming"`
+}
+
 func (h *Handler) List(c *gin.Context) {
-	i, e := auth.Get(c)
-	if e != nil {
-		apierror.Respond(c, e)
+	var query listQuery
+	if err := c.ShouldBindQuery(&query); err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_query", err.Error()))
 		return
 	}
-	out, e := h.service.List(c.Request.Context(), i.BetterAuthUserID)
-	if e != nil {
-		apierror.Respond(c, e)
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": out})
+	view, err := h.profiles.Me(c.Request.Context(), identity)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	output, err := h.service.List(c.Request.Context(), view.ID, ListInput{
+		Page:      query.Page,
+		PerPage:   query.PerPage,
+		Query:     query.Query,
+		EventType: query.EventType,
+		Sort:      query.Sort,
+	})
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":       output.Events,
+		"pagination": output.Pagination,
+	})
 }
+
 func (h *Handler) Get(c *gin.Context) {
-	id, e := uuid.Parse(c.Param("id"))
-	if e != nil {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
 		return
 	}
-	i, _ := auth.Get(c)
-	out, e := h.service.GetOwned(c.Request.Context(), id, i.BetterAuthUserID)
-	if e != nil {
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	view, err := h.profiles.Me(c.Request.Context(), identity)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	evt, err := h.service.GetOwned(c.Request.Context(), id, view.ID)
+	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		return
 	}
-	c.JSON(http.StatusOK, out)
+	c.JSON(http.StatusOK, evt)
 }

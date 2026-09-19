@@ -24,16 +24,17 @@ type Verifier struct {
 }
 
 func New(ctx context.Context, jwks, issuer, audience string) (*Verifier, error) {
-	keys, e := keyfunc.NewDefaultCtx(ctx, []string{jwks})
-	if e != nil {
-		return nil, e
+	keys, err := keyfunc.NewDefaultCtx(ctx, []string{jwks})
+	if err != nil {
+		return nil, err
 	}
 	return &Verifier{keys, issuer, audience}, nil
 }
+
 func (v *Verifier) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		h := c.GetHeader("Authorization")
-		if !strings.HasPrefix(h, "Bearer ") {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
 			apierror.Respond(c, apierror.New(http.StatusUnauthorized, "unauthenticated", "bearer token required"))
 			c.Abort()
 			return
@@ -46,8 +47,8 @@ func (v *Verifier) Middleware() gin.HandlerFunc {
 		if v.audience != "" {
 			opts = append(opts, jwt.WithAudience(v.audience))
 		}
-		t, e := jwt.ParseWithClaims(strings.TrimPrefix(h, "Bearer "), claims, v.keys.Keyfunc, opts...)
-		if e != nil || !t.Valid {
+		token, err := jwt.ParseWithClaims(strings.TrimPrefix(header, "Bearer "), claims, v.keys.Keyfunc, opts...)
+		if err != nil || !token.Valid {
 			apierror.Respond(c, apierror.New(http.StatusUnauthorized, "invalid_token", "invalid Better Auth token"))
 			c.Abort()
 			return
@@ -67,14 +68,15 @@ func (v *Verifier) Middleware() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
 func Get(c *gin.Context) (Identity, error) {
 	v, ok := c.Get(IdentityKey)
 	if !ok {
 		return Identity{}, fmt.Errorf("authenticated identity missing")
 	}
-	i, ok := v.(Identity)
+	identity, ok := v.(Identity)
 	if !ok {
 		return Identity{}, fmt.Errorf("invalid authenticated identity")
 	}
-	return i, nil
+	return identity, nil
 }

@@ -7,6 +7,12 @@
       "skillPath": "SKILL.md",
       "computedHash": "eff31d986cf60ba078c13d6cbe9b509734f8be650fb5d27f10e2b2626b464282"
     },
+    "architecture-patterns": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/backend-development/skills/architecture-patterns/SKILL.md",
+      "computedHash": "abdf3457f8a947a0079acde1517ecbce2cb46ff20b9ce4bf74f3b98827fea7c7"
+    },
     "golang-naming": {
       "source": "samber/cc-skills-golang",
       "sourceType": "github",
