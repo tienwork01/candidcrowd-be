@@ -31,6 +31,7 @@ type ListInput struct {
 	Query     string
 	EventType string
 	Sort      string
+	Direction string
 }
 
 type ListOutput struct {
@@ -80,6 +81,7 @@ func (s *Service) List(ctx context.Context, hostID uuid.UUID, in ListInput) (Lis
 		Query:     strings.TrimSpace(in.Query),
 		EventType: strings.TrimSpace(in.EventType),
 		Sort:      strings.TrimSpace(in.Sort),
+		Direction: strings.TrimSpace(in.Direction),
 	}
 
 	events, total, err := s.repo.ListByHost(ctx, hostID, filter)

@@ -70,7 +70,8 @@ type listQuery struct {
 	PerPage   int    `form:"per_page" binding:"omitempty,min=1,max=100"`
 	Query     string `form:"q" binding:"omitempty,max=100"`
 	EventType string `form:"type" binding:"omitempty,max=80"`
-	Sort      string `form:"sort" binding:"omitempty,oneof=newest oldest name upcoming"`
+	Sort      string `form:"sort" binding:"omitempty,oneof=newest oldest name upcoming created_at event_date"`
+	Direction string `form:"direction" binding:"omitempty,oneof=asc desc ASC DESC"`
 }
 
 func (h *Handler) List(c *gin.Context) {
@@ -95,6 +96,7 @@ func (h *Handler) List(c *gin.Context) {
 		Query:     query.Query,
 		EventType: query.EventType,
 		Sort:      query.Sort,
+		Direction: query.Direction,
 	})
 	if err != nil {
 		apierror.Respond(c, err)

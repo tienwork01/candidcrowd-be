@@ -65,21 +65,31 @@ func (r *inMemoryEventRepo) ListByHost(ctx context.Context, hostID uuid.UUID, fi
 
 	total := int64(len(matches))
 
-	// Sort
-	switch filter.Sort {
-	case "oldest":
-		sort.Slice(matches, func(i, j int) bool {
-			return matches[i].CreatedAt.Before(matches[j].CreatedAt)
-		})
+	direction := strings.ToLower(strings.TrimSpace(filter.Direction))
+	sortField := strings.ToLower(strings.TrimSpace(filter.Sort))
+
+	switch sortField {
 	case "name":
 		sort.Slice(matches, func(i, j int) bool {
+			if direction == "desc" {
+				return matches[i].Name > matches[j].Name
+			}
 			return matches[i].Name < matches[j].Name
 		})
-	case "upcoming":
+	case "upcoming", "event_date":
 		now := time.Now()
 		sort.Slice(matches, func(i, j int) bool {
 			iDate := matches[i].EventDate
 			jDate := matches[j].EventDate
+			if direction == "desc" {
+				if iDate == nil {
+					return false
+				}
+				if jDate == nil {
+					return true
+				}
+				return iDate.After(*jDate)
+			}
 			iUpcoming := iDate != nil && !iDate.Before(now)
 			jUpcoming := jDate != nil && !jDate.Before(now)
 			if iUpcoming && jUpcoming {
@@ -93,8 +103,19 @@ func (r *inMemoryEventRepo) ListByHost(ctx context.Context, hostID uuid.UUID, fi
 			}
 			return matches[i].CreatedAt.After(matches[j].CreatedAt)
 		})
-	default: // "newest"
+	case "oldest":
 		sort.Slice(matches, func(i, j int) bool {
+			return matches[i].CreatedAt.Before(matches[j].CreatedAt)
+		})
+	case "newest":
+		sort.Slice(matches, func(i, j int) bool {
+			return matches[i].CreatedAt.After(matches[j].CreatedAt)
+		})
+	default: // "created_at" or unspecified
+		sort.Slice(matches, func(i, j int) bool {
+			if direction == "asc" {
+				return matches[i].CreatedAt.Before(matches[j].CreatedAt)
+			}
 			return matches[i].CreatedAt.After(matches[j].CreatedAt)
 		})
 	}
@@ -390,13 +411,21 @@ func TestEventListSort(t *testing.T) {
 	_, err = svc.Create(ctx, hostID, CreateInput{Name: "Charlie Event"})
 	require.NoError(t, err)
 
-	// Sort by name
-	res, err := svc.List(ctx, hostID, ListInput{Sort: "name"})
+	// Sort by name asc (default for name)
+	res, err := svc.List(ctx, hostID, ListInput{Sort: "name", Direction: "asc"})
 	require.NoError(t, err)
 	require.Len(t, res.Events, 3)
 	require.Equal(t, "Alpha Event", res.Events[0].Name)
 	require.Equal(t, "Bravo Event", res.Events[1].Name)
 	require.Equal(t, "Charlie Event", res.Events[2].Name)
+
+	// Sort by name desc
+	resDesc, err := svc.List(ctx, hostID, ListInput{Sort: "name", Direction: "desc"})
+	require.NoError(t, err)
+	require.Len(t, resDesc.Events, 3)
+	require.Equal(t, "Charlie Event", resDesc.Events[0].Name)
+	require.Equal(t, "Bravo Event", resDesc.Events[1].Name)
+	require.Equal(t, "Alpha Event", resDesc.Events[2].Name)
 }
 
 func TestEventHandlerListWithQuery(t *testing.T) {
@@ -434,8 +463,8 @@ func TestEventHandlerListWithQuery(t *testing.T) {
 	})
 	r.GET("/events", handler.List)
 
-	// Request with query params
-	req := httptest.NewRequest(http.MethodGet, "/events?page=1&per_page=10&q=wedding&type=Wedding&sort=name", nil)
+	// Request with query params including direction=asc
+	req := httptest.NewRequest(http.MethodGet, "/events?page=1&per_page=10&q=wedding&type=Wedding&sort=name&direction=asc", nil)
 	res := httptest.NewRecorder()
 	r.ServeHTTP(res, req)
 

@@ -14,6 +14,7 @@ type ListFilter struct {
 	Query     string
 	EventType string
 	Sort      string
+	Direction string
 }
 
 type Repository interface {
@@ -52,15 +53,32 @@ func (r *gormRepository) ListByHost(ctx context.Context, hostID uuid.UUID, filte
 		return nil, 0, err
 	}
 
-	switch filter.Sort {
+	direction := strings.ToLower(strings.TrimSpace(filter.Direction))
+	sortField := strings.ToLower(strings.TrimSpace(filter.Sort))
+
+	switch sortField {
+	case "name":
+		if direction == "desc" {
+			db = db.Order("name DESC")
+		} else {
+			db = db.Order("name ASC")
+		}
+	case "event_date", "upcoming":
+		if direction == "desc" {
+			db = db.Order("event_date DESC NULLS LAST, created_at DESC")
+		} else {
+			db = db.Order("CASE WHEN event_date IS NOT NULL AND event_date >= CURRENT_DATE THEN 0 ELSE 1 END, CASE WHEN event_date IS NOT NULL AND event_date >= CURRENT_DATE THEN event_date END ASC, event_date DESC, created_at DESC")
+		}
 	case "oldest":
 		db = db.Order("created_at ASC")
-	case "name":
-		db = db.Order("name ASC")
-	case "upcoming":
-		db = db.Order("CASE WHEN event_date IS NOT NULL AND event_date >= CURRENT_DATE THEN 0 ELSE 1 END, CASE WHEN event_date IS NOT NULL AND event_date >= CURRENT_DATE THEN event_date END ASC, event_date DESC, created_at DESC")
-	default: // "newest"
+	case "newest":
 		db = db.Order("created_at DESC")
+	default: // "created_at" or unspecified
+		if direction == "asc" {
+			db = db.Order("created_at ASC")
+		} else {
+			db = db.Order("created_at DESC")
+		}
 	}
 
 	page := filter.Page
