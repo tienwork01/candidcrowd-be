@@ -58,6 +58,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 
 	pub := api.Group("/public/events/:slug")
 	pub.GET("", cfg.Public.Event)
+	pub.GET("/media", cfg.Public.Media)
+	pub.GET("/media/:mediaId/content", cfg.Public.MediaContent)
 	pub.POST("/sessions", cfg.Public.CreateSession)
 	pub.POST("/uploads", cfg.Public.CreateUpload)
 	pub.POST("/uploads/:uploadId/complete", cfg.Public.Complete)

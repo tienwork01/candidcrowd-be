@@ -12,7 +12,6 @@ import (
 
 type Config struct {
 	// App
-	AppName  string
 	Env      string
 	HTTPAddr string
 	LogLevel string
@@ -52,6 +51,15 @@ type Config struct {
 	EventMaxBytes   int64
 	UploadRateLimit int
 	RateWindow      time.Duration
+
+	// Weekly Google Drive archive. All values are environment supplied.
+	DailyArchiveEnabled   bool
+	DailyArchiveSchedule  string
+	DailyArchiveMinAge    time.Duration
+	GoogleDriveClientID   string
+	GoogleDriveSecret     string
+	GoogleDriveRefresh    string
+	GoogleDriveRootFolder string
 }
 
 func Load() (Config, error) {
@@ -90,9 +98,20 @@ func Load() (Config, error) {
 		}
 		return val
 	}
+	parseBool := func(k string, d bool) bool {
+		raw := os.Getenv(k)
+		if raw == "" {
+			return d
+		}
+		val, err := strconv.ParseBool(raw)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s has invalid boolean %q", k, raw))
+			return d
+		}
+		return val
+	}
 
 	c := Config{
-		AppName:  str("APP_NAME", "CandidCrowd"),
 		Env:      str("APP_ENV", "development"),
 		HTTPAddr: str("HTTP_ADDR", ":8080"),
 		LogLevel: str("LOG_LEVEL", "info"),
@@ -125,6 +144,14 @@ func Load() (Config, error) {
 		EventMaxBytes:   parseInt64("EVENT_MAX_MEDIA_BYTES", 5<<30),
 		UploadRateLimit: parseInt("UPLOAD_RATE_LIMIT", 20),
 		RateWindow:      parseDuration("UPLOAD_RATE_WINDOW", "1m"),
+
+		DailyArchiveEnabled:   parseBool("MEDIA_DAILY_ARCHIVE_ENABLED", false),
+		DailyArchiveSchedule:  str("MEDIA_DAILY_ARCHIVE_SCHEDULE", "0 2 * * *"),
+		DailyArchiveMinAge:    parseDuration("MEDIA_DAILY_ARCHIVE_MIN_AGE", "24h"),
+		GoogleDriveClientID:   os.Getenv("GOOGLE_DRIVE_CLIENT_ID"),
+		GoogleDriveSecret:     os.Getenv("GOOGLE_DRIVE_CLIENT_SECRET"),
+		GoogleDriveRefresh:    os.Getenv("GOOGLE_DRIVE_REFRESH_TOKEN"),
+		GoogleDriveRootFolder: os.Getenv("GOOGLE_DRIVE_ROOT_FOLDER_ID"),
 	}
 
 	var missing []string
@@ -142,6 +169,24 @@ func Load() (Config, error) {
 	}
 	if c.R2Bucket == "" {
 		missing = append(missing, "R2_BUCKET")
+	}
+	if c.Env != "development" && c.R2AccessKey == "" {
+		missing = append(missing, "R2_ACCESS_KEY_ID")
+	}
+	if c.Env != "development" && c.R2Secret == "" {
+		missing = append(missing, "R2_SECRET_ACCESS_KEY")
+	}
+	if c.DailyArchiveEnabled {
+		for _, required := range []struct{ name, value string }{
+			{"GOOGLE_DRIVE_CLIENT_ID", c.GoogleDriveClientID},
+			{"GOOGLE_DRIVE_CLIENT_SECRET", c.GoogleDriveSecret},
+			{"GOOGLE_DRIVE_REFRESH_TOKEN", c.GoogleDriveRefresh},
+			{"GOOGLE_DRIVE_ROOT_FOLDER_ID", c.GoogleDriveRootFolder},
+		} {
+			if required.value == "" {
+				missing = append(missing, required.name)
+			}
+		}
 	}
 
 	if len(missing) > 0 {

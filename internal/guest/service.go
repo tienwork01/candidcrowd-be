@@ -27,7 +27,10 @@ func (s *Service) Create(ctx context.Context, eventID uuid.UUID) (Session, strin
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	hash := sha256.Sum256([]byte(token))
-	session := Session{EventID: eventID, TokenHash: hash[:], ExpiresAt: time.Now().Add(s.ttl)}
+	// Generate the primary key in the application rather than relying on the
+	// database default. This keeps inserts portable and avoids a driver-specific
+	// UUID scan from a RETURNING clause.
+	session := Session{ID: uuid.New(), EventID: eventID, TokenHash: hash[:], ExpiresAt: time.Now().Add(s.ttl)}
 	return session, token, s.repo.Create(ctx, &session)
 }
 

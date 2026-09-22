@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/google/uuid"
@@ -102,11 +103,18 @@ func (r *gormRepository) ListByHost(ctx context.Context, hostID uuid.UUID, filte
 func (r *gormRepository) GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, error) {
 	var evt Event
 	err := r.db.WithContext(ctx).Where("id = ? AND host_id = ?", id, hostID).First(&evt).Error
-	return evt, err
+	return evt, mapNotFound(err)
 }
 
 func (r *gormRepository) GetPublic(ctx context.Context, slug string) (Event, error) {
 	var evt Event
 	err := r.db.WithContext(ctx).Where("slug = ? AND status = ?", slug, StatusActive).First(&evt).Error
-	return evt, err
+	return evt, mapNotFound(err)
+}
+
+func mapNotFound(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrNotFound
+	}
+	return err
 }

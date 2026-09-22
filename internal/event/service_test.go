@@ -19,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 type inMemoryEventRepo struct {
@@ -148,7 +147,7 @@ func (r *inMemoryEventRepo) GetOwned(ctx context.Context, id, hostID uuid.UUID) 
 	defer r.mu.RUnlock()
 	e, ok := r.events[id]
 	if !ok || e.HostID != hostID {
-		return Event{}, gorm.ErrRecordNotFound
+		return Event{}, ErrNotFound
 	}
 	return e, nil
 }
@@ -161,7 +160,7 @@ func (r *inMemoryEventRepo) GetPublic(ctx context.Context, slug string) (Event, 
 			return e, nil
 		}
 	}
-	return Event{}, gorm.ErrRecordNotFound
+	return Event{}, ErrNotFound
 }
 
 func TestEventCreateAndIsolation(t *testing.T) {
@@ -210,7 +209,7 @@ func TestEventCreateAndIsolation(t *testing.T) {
 	// Host 2 CANNOT get Host 1 event (returns record not found)
 	_, err = svc.GetOwned(ctx, e1.ID, host2ID)
 	require.Error(t, err)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestEventCreateValidation(t *testing.T) {

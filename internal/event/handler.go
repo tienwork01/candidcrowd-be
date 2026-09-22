@@ -126,7 +126,11 @@ func (h *Handler) Get(c *gin.Context) {
 	}
 	evt, err := h.service.GetOwned(c.Request.Context(), id, view.ID)
 	if err != nil {
-		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
+		if errors.Is(err, ErrNotFound) {
+			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
+		} else {
+			apierror.Respond(c, err)
+		}
 		return
 	}
 	c.JSON(http.StatusOK, evt)

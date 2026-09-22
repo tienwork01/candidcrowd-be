@@ -1,10 +1,15 @@
 package event
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrNotFound is a domain-facing repository result. Infrastructure adapters
+// map their persistence-specific not-found errors to this value.
+var ErrNotFound = errors.New("event: not found")
 
 type Status string
 

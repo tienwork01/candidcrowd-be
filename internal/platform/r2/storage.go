@@ -3,6 +3,7 @@ package r2
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -61,4 +62,16 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectInfo, error) {
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	return err
+}
+
+func (c *Client) OpenRead(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	if out.ContentLength == nil {
+		_ = out.Body.Close()
+		return nil, ObjectInfo{}, fmt.Errorf("object has no content length")
+	}
+	return out.Body, ObjectInfo{Size: *out.ContentLength, ContentType: aws.ToString(out.ContentType)}, nil
 }

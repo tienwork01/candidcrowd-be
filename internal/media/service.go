@@ -2,16 +2,14 @@ package media
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/candidcrowd/candidcrowd-backend/internal/event"
-	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
 	"github.com/google/uuid"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type ObjectInfo struct {
@@ -31,7 +29,7 @@ type Limiter interface {
 }
 
 type Service struct {
-	db                 *gorm.DB
+	repo               Repository
 	storage            Storage
 	limiter            Limiter
 	expiry, window     time.Duration
@@ -39,8 +37,8 @@ type Service struct {
 	maxImage, maxVideo int64
 }
 
-func NewService(db *gorm.DB, storage Storage, limiter Limiter, expiry, window time.Duration, rate int, maxImage, maxVideo int64) *Service {
-	return &Service{db, storage, limiter, expiry, window, rate, maxImage, maxVideo}
+func NewService(repo Repository, storage Storage, limiter Limiter, expiry, window time.Duration, rate int, maxImage, maxVideo int64) *Service {
+	return &Service{repo, storage, limiter, expiry, window, rate, maxImage, maxVideo}
 }
 
 type CreateInput struct {
@@ -49,58 +47,58 @@ type CreateInput struct {
 	SessionToken       string
 }
 type UploadTarget struct {
-	MediaID   uuid.UUID `json:"media_id"`
-	UploadURL string    `json:"upload_url"`
-	ExpiresAt time.Time `json:"expires_at"`
+	MediaID         uuid.UUID         `json:"media_id"`
+	UploadURL       string            `json:"upload_url"`
+	ExpiresAt       time.Time         `json:"expires_at"`
+	RequiredHeaders map[string]string `json:"required_headers"`
 }
 
-func (s *Service) CreateUpload(ctx context.Context, e event.Event, session guest.Session, in CreateInput) (UploadTarget, error) {
-	if e.Status != event.StatusActive {
+type UploadScope struct {
+	EventID        uuid.UUID
+	GuestSessionID uuid.UUID
+	Accepting      bool
+	MaxEventBytes  int64
+}
+
+func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in CreateInput) (UploadTarget, error) {
+	if !scope.Accepting {
 		return UploadTarget{}, fmt.Errorf("event is not accepting uploads")
 	}
 	if in.Size <= 0 || !allowed(in.MIMEType) || in.Size > limitByMIME(in.MIMEType, s.maxImage, s.maxVideo) {
 		return UploadTarget{}, fmt.Errorf("invalid media type or file size")
 	}
-	ok, err := s.limiter.Allow(ctx, "upload:"+session.ID.String(), s.rate, s.window)
+	ok, err := s.limiter.Allow(ctx, "upload:"+scope.GuestSessionID.String(), s.rate, s.window)
 	if err != nil {
 		return UploadTarget{}, err
 	}
 	if !ok {
 		return UploadTarget{}, fmt.Errorf("upload rate limit exceeded")
 	}
-	m := Media{ID: uuid.New(), EventID: e.ID, GuestSessionID: session.ID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, ExpectedSize: in.Size, Status: StatusPending}
-	m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", e.ID, m.ID, extension(in.MIMEType))
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var locked event.Event
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, "id = ?", e.ID).Error; err != nil {
-			return err
-		}
-		var reserved int64
-		if err := tx.Model(&Media{}).Where("event_id = ? AND status = ?", e.ID, StatusPending).Select("COALESCE(SUM(expected_size), 0)").Scan(&reserved).Error; err != nil {
-			return err
-		}
-		if locked.UsedMediaBytes+reserved+in.Size > locked.MaxMediaBytes {
-			return fmt.Errorf("event storage quota exceeded")
-		}
-		return tx.Create(&m).Error
-	})
+	m := Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, ExpectedSize: in.Size, Status: StatusPending}
+	m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", scope.EventID, m.ID, extension(in.MIMEType))
+	err = s.repo.ReserveUpload(ctx, m, scope.MaxEventBytes)
 	if err != nil {
 		return UploadTarget{}, err
 	}
 	url, err := s.storage.PresignPut(ctx, m.ObjectKey, m.MIMEType, s.expiry)
 	if err != nil {
-		_ = s.db.WithContext(ctx).Delete(&m).Error
+		_ = s.repo.Delete(ctx, m.ID)
 		return UploadTarget{}, err
 	}
-	return UploadTarget{m.ID, url, time.Now().Add(s.expiry)}, nil
+	return UploadTarget{
+		MediaID:         m.ID,
+		UploadURL:       url,
+		ExpiresAt:       time.Now().Add(s.expiry),
+		RequiredHeaders: map[string]string{"Content-Type": m.MIMEType},
+	}, nil
 }
 
-func (s *Service) Complete(ctx context.Context, e event.Event, session guest.Session, mediaID uuid.UUID) error {
-	if e.Status != event.StatusActive {
+func (s *Service) Complete(ctx context.Context, scope UploadScope, mediaID uuid.UUID) error {
+	if !scope.Accepting {
 		return fmt.Errorf("event is not accepting uploads")
 	}
-	var m Media
-	if err := s.db.WithContext(ctx).Where("id = ? AND event_id = ? AND guest_session_id = ? AND status = ?", mediaID, e.ID, session.ID, StatusPending).First(&m).Error; err != nil {
+	m, err := s.repo.FindUploadForSession(ctx, mediaID, scope.EventID, scope.GuestSessionID)
+	if err != nil {
 		return err
 	}
 	obj, err := s.storage.Head(ctx, m.ObjectKey)
@@ -110,17 +108,73 @@ func (s *Service) Complete(ctx context.Context, e event.Event, session guest.Ses
 	if obj.Size != m.ExpectedSize || obj.ContentType != m.MIMEType {
 		return fmt.Errorf("uploaded object metadata does not match requested upload")
 	}
-	now := time.Now()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&Media{}).Where("id = ? AND status = ?", m.ID, StatusPending).Updates(map[string]any{"status": StatusReady, "actual_size": obj.Size, "uploaded_at": now})
-		if result.Error != nil {
-			return result.Error
+	return s.repo.MarkReady(ctx, scope.EventID, m.ID, obj.Size, time.Now())
+}
+
+type CursorPage struct {
+	Data       []PublicView
+	NextCursor string
+	HasMore    bool
+}
+
+func (s *Service) ListReady(ctx context.Context, eventID uuid.UUID, limit int, cursor string, urlFor func(uuid.UUID) string) (CursorPage, error) {
+	if limit < 1 || limit > 100 {
+		limit = 60
+	}
+	var before *Cursor
+	if cursor != "" {
+		var c struct {
+			CreatedAt time.Time `json:"created_at"`
+			ID        uuid.UUID `json:"id"`
 		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("upload was already completed")
+		raw, e := base64.RawURLEncoding.DecodeString(cursor)
+		if e != nil || json.Unmarshal(raw, &c) != nil {
+			return CursorPage{}, fmt.Errorf("invalid cursor")
 		}
-		return tx.Model(&event.Event{}).Where("id = ?", e.ID).UpdateColumn("used_media_bytes", gorm.Expr("used_media_bytes + ?", obj.Size)).Error
-	})
+		before = &Cursor{CreatedAt: c.CreatedAt, ID: c.ID}
+	}
+	records, err := s.repo.ListReady(ctx, eventID, limit+1, before)
+	if err != nil {
+		return CursorPage{}, err
+	}
+	hasMore := len(records) > limit
+	if hasMore {
+		records = records[:limit]
+	}
+	views := make([]PublicView, 0, len(records))
+	for _, record := range records {
+		views = append(views, PublicView{
+			ID:        record.ID,
+			URL:       urlFor(record.ID),
+			MIMEType:  record.MIMEType,
+			CreatedAt: record.CreatedAt,
+			IsVideo:   strings.HasPrefix(record.MIMEType, "video/"),
+		})
+	}
+	page := CursorPage{Data: views, HasMore: hasMore}
+	if hasMore {
+		last := records[len(records)-1]
+		raw, _ := json.Marshal(struct {
+			CreatedAt time.Time `json:"created_at"`
+			ID        uuid.UUID `json:"id"`
+		}{last.CreatedAt, last.ID})
+		page.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
+	}
+	return page, nil
+}
+
+func (s *Service) ReadURL(ctx context.Context, eventID, mediaID uuid.UUID, expiry time.Duration) (string, error) {
+	record, err := s.repo.FindReady(ctx, eventID, mediaID)
+	if err != nil {
+		return "", err
+	}
+	return s.storage.PresignGet(ctx, record.ObjectKey, expiry)
+}
+
+// ArchivedLocation returns the opaque Google Drive reference for an archived
+// original. It is intentionally never serialized to API clients.
+func (s *Service) ArchivedLocation(ctx context.Context, eventID, mediaID uuid.UUID) (string, error) {
+	return s.repo.FindArchivedLocation(ctx, eventID, mediaID)
 }
 
 var supportedMIMETypes = map[string]string{

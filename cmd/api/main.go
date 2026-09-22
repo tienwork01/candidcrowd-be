@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/candidcrowd/candidcrowd-backend/internal/archive"
 	"github.com/candidcrowd/candidcrowd-backend/internal/config"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
@@ -18,10 +19,12 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/database"
+	"github.com/candidcrowd/candidcrowd-backend/internal/platform/googledrive"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/r2"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
+	"github.com/robfig/cron/v3"
 )
 
 func main() {
@@ -71,7 +74,32 @@ func run() error {
 	profiles := profile.NewService(profile.NewGormRepository(db), cfg.TermsVersion, cfg.PrivacyVersion)
 	eventHandler := event.NewHandler(events, profiles)
 	guests := guest.NewService(guest.NewGormRepository(db), 24*time.Hour)
-	uploads := media.NewService(db, storage, limiter, cfg.PresignExpiry, cfg.RateWindow, cfg.UploadRateLimit, cfg.MaxImageBytes, cfg.MaxVideoBytes)
+	uploads := media.NewService(database.NewMediaRepository(db), storage, limiter, cfg.PresignExpiry, cfg.RateWindow, cfg.UploadRateLimit, cfg.MaxImageBytes, cfg.MaxVideoBytes)
+	var driveReader *googledrive.Client
+	var archiveCron *cron.Cron
+	if cfg.DailyArchiveEnabled {
+		driveClient, driveErr := googledrive.New(ctx, cfg.GoogleDriveClientID, cfg.GoogleDriveSecret, cfg.GoogleDriveRefresh, cfg.GoogleDriveRootFolder)
+		if driveErr != nil {
+			return driveErr
+		}
+		driveReader = driveClient
+		archiveService := archive.New(database.NewArchiveRepository(db), storage, driveClient, cfg.DailyArchiveMinAge)
+		archiveCron = cron.New()
+		if _, scheduleErr := archiveCron.AddFunc(cfg.DailyArchiveSchedule, func() {
+			jobCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if jobErr := archiveService.Run(jobCtx, 50); jobErr != nil {
+				logger.Error("daily media archive failed", "error", jobErr)
+			}
+		}); scheduleErr != nil {
+			return scheduleErr
+		}
+		archiveCron.Start()
+		logger.Info("daily media archive enabled", "schedule", cfg.DailyArchiveSchedule)
+	}
+	if archiveCron != nil {
+		defer archiveCron.Stop()
+	}
 	router := httpapi.NewRouter(httpapi.RouterConfig{
 		Logger:         logger,
 		Auth:           authn,
@@ -80,7 +108,7 @@ func run() error {
 		DatabaseReady:  sqlDB.PingContext,
 		Profiles:       profile.NewHandler(profiles),
 		Events:         eventHandler,
-		Public:         httpapi.NewPublicHandler(events, guests, uploads),
+		Public:         httpapi.NewPublicHandler(events, guests, uploads, driveReader),
 	})
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
