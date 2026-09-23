@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,9 @@ func NewService(repo Repository, storage Storage, limiter Limiter, expiry, windo
 type CreateInput struct {
 	Filename, MIMEType string
 	Size               int64
+	ChecksumSHA256     string
 	SessionToken       string
+	ClientUploadID     uuid.UUID
 }
 type UploadTarget struct {
 	MediaID         uuid.UUID         `json:"media_id"`
@@ -64,25 +67,54 @@ func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in Create
 	if !scope.Accepting {
 		return UploadTarget{}, fmt.Errorf("event is not accepting uploads")
 	}
-	if in.Size <= 0 || !allowed(in.MIMEType) || in.Size > limitByMIME(in.MIMEType, s.maxImage, s.maxVideo) {
+	if in.Size <= 0 || !allowed(in.MIMEType) || in.Size > limitByMIME(in.MIMEType, s.maxImage, s.maxVideo) || !validSHA256(in.ChecksumSHA256) {
 		return UploadTarget{}, fmt.Errorf("invalid media type or file size")
 	}
-	ok, err := s.limiter.Allow(ctx, "upload:"+scope.GuestSessionID.String(), s.rate, s.window)
-	if err != nil {
-		return UploadTarget{}, err
+	if in.ClientUploadID == uuid.Nil {
+		return UploadTarget{}, fmt.Errorf("client upload id is required")
 	}
-	if !ok {
-		return UploadTarget{}, fmt.Errorf("upload rate limit exceeded")
+	// A browser can lose the response after the reservation committed. Reuse the
+	// same record/object key on the next request rather than reserving quota again.
+	m, existingErr := s.repo.FindByClientUpload(ctx, scope.EventID, scope.GuestSessionID, in.ClientUploadID)
+	created := false
+	if existingErr != nil && !errors.Is(existingErr, ErrNotFound) {
+		return UploadTarget{}, existingErr
 	}
-	m := Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, ExpectedSize: in.Size, Status: StatusPending}
-	m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", scope.EventID, m.ID, extension(in.MIMEType))
-	err = s.repo.ReserveUpload(ctx, m, scope.MaxEventBytes)
-	if err != nil {
-		return UploadTarget{}, err
+	if errors.Is(existingErr, ErrNotFound) {
+		duplicate, err := s.repo.HasReadyChecksum(ctx, scope.EventID, in.ChecksumSHA256)
+		if err != nil {
+			return UploadTarget{}, err
+		}
+		if duplicate {
+			return UploadTarget{}, ErrDuplicate
+		}
+		ok, err := s.limiter.Allow(ctx, "upload:"+scope.GuestSessionID.String(), s.rate, s.window)
+		if err != nil {
+			return UploadTarget{}, err
+		}
+		if !ok {
+			return UploadTarget{}, fmt.Errorf("upload rate limit exceeded")
+		}
+		clientID := in.ClientUploadID
+		m = Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, ExpectedSize: in.Size, ChecksumSHA256: strings.ToLower(in.ChecksumSHA256), ClientUploadID: &clientID, Status: StatusPending, LastActivityAt: time.Now()}
+		m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", scope.EventID, m.ID, extension(in.MIMEType))
+		err = s.repo.ReserveUpload(ctx, m, scope.MaxEventBytes)
+		if err != nil {
+			// A concurrent duplicate request may have won the unique client ID race.
+			if existing, findErr := s.repo.FindByClientUpload(ctx, scope.EventID, scope.GuestSessionID, in.ClientUploadID); findErr == nil {
+				m = existing
+			} else {
+				return UploadTarget{}, err
+			}
+		} else {
+			created = true
+		}
 	}
 	url, err := s.storage.PresignPut(ctx, m.ObjectKey, m.MIMEType, s.expiry)
 	if err != nil {
-		_ = s.repo.Delete(ctx, m.ID)
+		if created {
+			_ = s.repo.Delete(ctx, m.ID)
+		}
 		return UploadTarget{}, err
 	}
 	return UploadTarget{
@@ -101,6 +133,9 @@ func (s *Service) Complete(ctx context.Context, scope UploadScope, mediaID uuid.
 	if err != nil {
 		return err
 	}
+	if m.Status == StatusReady {
+		return nil
+	}
 	obj, err := s.storage.Head(ctx, m.ObjectKey)
 	if err != nil {
 		return fmt.Errorf("uploaded object is unavailable: %w", err)
@@ -108,7 +143,38 @@ func (s *Service) Complete(ctx context.Context, scope UploadScope, mediaID uuid.
 	if obj.Size != m.ExpectedSize || obj.ContentType != m.MIMEType {
 		return fmt.Errorf("uploaded object metadata does not match requested upload")
 	}
-	return s.repo.MarkReady(ctx, scope.EventID, m.ID, obj.Size, time.Now())
+	err = s.repo.MarkReady(ctx, scope.EventID, m.ID, obj.Size, time.Now())
+	if errors.Is(err, ErrNotFound) {
+		// Another complete request may have won the race. Treat it as success if
+		// it made the same event/session-owned record ready.
+		if current, findErr := s.repo.FindUploadForSession(ctx, mediaID, scope.EventID, scope.GuestSessionID); findErr == nil && current.Status == StatusReady {
+			return nil
+		}
+	}
+	if errors.Is(err, ErrDuplicate) {
+		_ = s.storage.Delete(ctx, m.ObjectKey)
+		_ = s.repo.Delete(ctx, m.ID)
+	}
+	return err
+}
+
+// ExpireStale removes abandoned reservations. A later retry always creates or
+// reuses a client-idempotent upload record, so stale rows must not consume an
+// event's upload quota forever.
+func (s *Service) ExpireStale(ctx context.Context, before time.Time, limit int) error {
+	items, err := s.repo.FindStale(ctx, before, limit)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if err := s.storage.Delete(ctx, item.ObjectKey); err != nil {
+			return err
+		}
+		if err := s.repo.Delete(ctx, item.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type CursorPage struct {
@@ -199,4 +265,16 @@ func limitByMIME(mimeType string, maxImageBytes, maxVideoBytes int64) int64 {
 
 func extension(mimeType string) string {
 	return supportedMIMETypes[mimeType]
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
 }

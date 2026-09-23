@@ -75,6 +75,18 @@ func run() error {
 	eventHandler := event.NewHandler(events, profiles)
 	guests := guest.NewService(guest.NewGormRepository(db), 24*time.Hour)
 	uploads := media.NewService(database.NewMediaRepository(db), storage, limiter, cfg.PresignExpiry, cfg.RateWindow, cfg.UploadRateLimit, cfg.MaxImageBytes, cfg.MaxVideoBytes)
+	cleanupCron := cron.New()
+	if _, scheduleErr := cleanupCron.AddFunc(cfg.StaleUploadSchedule, func() {
+		jobCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if jobErr := uploads.ExpireStale(jobCtx, time.Now().Add(-cfg.StaleUploadAge), 100); jobErr != nil {
+			logger.Error("stale upload cleanup failed", "error", jobErr)
+		}
+	}); scheduleErr != nil {
+		return scheduleErr
+	}
+	cleanupCron.Start()
+	defer cleanupCron.Stop()
 	var driveReader *googledrive.Client
 	var archiveCron *cron.Cron
 	if cfg.DailyArchiveEnabled {

@@ -46,11 +46,13 @@ type Config struct {
 	PresignExpiry time.Duration
 
 	// Media Limits
-	MaxImageBytes   int64
-	MaxVideoBytes   int64
-	EventMaxBytes   int64
-	UploadRateLimit int
-	RateWindow      time.Duration
+	MaxImageBytes       int64
+	MaxVideoBytes       int64
+	EventMaxBytes       int64
+	UploadRateLimit     int
+	RateWindow          time.Duration
+	StaleUploadAge      time.Duration
+	StaleUploadSchedule string
 
 	// Weekly Google Drive archive. All values are environment supplied.
 	DailyArchiveEnabled   bool
@@ -139,11 +141,13 @@ func Load() (Config, error) {
 		R2Secret:      os.Getenv("R2_SECRET_ACCESS_KEY"),
 		PresignExpiry: parseDuration("R2_PRESIGN_EXPIRY", "15m"),
 
-		MaxImageBytes:   parseInt64("UPLOAD_MAX_IMAGE_BYTES", 25<<20),
-		MaxVideoBytes:   parseInt64("UPLOAD_MAX_VIDEO_BYTES", 500<<20),
-		EventMaxBytes:   parseInt64("EVENT_MAX_MEDIA_BYTES", 5<<30),
-		UploadRateLimit: parseInt("UPLOAD_RATE_LIMIT", 20),
-		RateWindow:      parseDuration("UPLOAD_RATE_WINDOW", "1m"),
+		MaxImageBytes:       parseInt64("UPLOAD_MAX_IMAGE_BYTES", 25<<20),
+		MaxVideoBytes:       parseInt64("UPLOAD_MAX_VIDEO_BYTES", 500<<20),
+		EventMaxBytes:       parseInt64("EVENT_MAX_MEDIA_BYTES", 5<<30),
+		UploadRateLimit:     parseInt("UPLOAD_RATE_LIMIT", 20),
+		RateWindow:          parseDuration("UPLOAD_RATE_WINDOW", "1m"),
+		StaleUploadAge:      parseDuration("UPLOAD_STALE_AGE", "24h"),
+		StaleUploadSchedule: str("UPLOAD_STALE_CLEANUP_SCHEDULE", "*/15 * * * *"),
 
 		DailyArchiveEnabled:   parseBool("MEDIA_DAILY_ARCHIVE_ENABLED", false),
 		DailyArchiveSchedule:  str("MEDIA_DAILY_ARCHIVE_SCHEDULE", "0 2 * * *"),

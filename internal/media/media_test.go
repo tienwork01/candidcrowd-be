@@ -50,13 +50,29 @@ func (r *memoryRepository) ReserveUpload(_ context.Context, record Media, _ int6
 	r.records[record.ID] = record
 	return nil
 }
+func (r *memoryRepository) FindByClientUpload(_ context.Context, eventID, sessionID, clientUploadID uuid.UUID) (Media, error) {
+	for _, record := range r.records {
+		if record.EventID == eventID && record.GuestSessionID == sessionID && record.ClientUploadID != nil && *record.ClientUploadID == clientUploadID {
+			return record, nil
+		}
+	}
+	return Media{}, ErrNotFound
+}
+func (r *memoryRepository) HasReadyChecksum(_ context.Context, eventID uuid.UUID, checksumSHA256 string) (bool, error) {
+	for id, record := range r.records {
+		if r.ready[id] && record.EventID == eventID && record.ChecksumSHA256 == checksumSHA256 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 func (r *memoryRepository) Delete(_ context.Context, id uuid.UUID) error {
 	delete(r.records, id)
 	return nil
 }
 func (r *memoryRepository) FindUploadForSession(_ context.Context, id, eventID, sessionID uuid.UUID) (Media, error) {
 	record, ok := r.records[id]
-	if !ok || record.EventID != eventID || record.GuestSessionID != sessionID || r.ready[id] {
+	if !ok || record.EventID != eventID || record.GuestSessionID != sessionID {
 		return Media{}, ErrNotFound
 	}
 	return record, nil
@@ -83,6 +99,15 @@ func (r *memoryRepository) FindReady(_ context.Context, eventID, id uuid.UUID) (
 func (r *memoryRepository) FindArchivedLocation(context.Context, uuid.UUID, uuid.UUID) (string, error) {
 	return "", ErrNotFound
 }
+func (r *memoryRepository) FindStale(_ context.Context, before time.Time, _ int) ([]Media, error) {
+	items := make([]Media, 0)
+	for _, record := range r.records {
+		if record.Status != StatusReady && record.LastActivityAt.Before(before) {
+			items = append(items, record)
+		}
+	}
+	return items, nil
+}
 
 type memoryStorage struct{ head ObjectInfo }
 
@@ -106,13 +131,42 @@ func TestServiceCreatesAndCompletesWithoutInfrastructure(t *testing.T) {
 	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}}, allowAllLimiter{}, time.Minute, time.Minute, 1, 100, 100)
 	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 1_000}
 
-	target, err := service.CreateUpload(context.Background(), scope, CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42})
+	input := CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", ClientUploadID: uuid.New()}
+	target, err := service.CreateUpload(context.Background(), scope, input)
 	require.NoError(t, err)
 	require.NotEmpty(t, target.UploadURL)
 
 	require.NoError(t, service.Complete(context.Background(), scope, target.MediaID))
+	require.NoError(t, service.Complete(context.Background(), scope, target.MediaID), "complete must survive a lost success response")
 	record, err := repo.FindReady(context.Background(), scope.EventID, target.MediaID)
 	require.NoError(t, err)
 	require.Equal(t, StatusReady, record.Status)
 	require.EqualValues(t, 42, *record.ActualSize)
+}
+
+func TestServiceRejectsReadyChecksumInSameEvent(t *testing.T) {
+	repo := newMemoryRepository()
+	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}}, allowAllLimiter{}, time.Minute, time.Minute, 1, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 1_000}
+	checksum := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	target, err := service.CreateUpload(context.Background(), scope, CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: checksum, ClientUploadID: uuid.New()})
+	require.NoError(t, err)
+	require.NoError(t, service.Complete(context.Background(), scope, target.MediaID))
+
+	_, err = service.CreateUpload(context.Background(), scope, CreateInput{Filename: "same.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: checksum, ClientUploadID: uuid.New()})
+	require.ErrorIs(t, err, ErrDuplicate)
+}
+
+func TestServiceReusesClientUploadAfterLostCreateResponse(t *testing.T) {
+	repo := newMemoryRepository()
+	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}}, allowAllLimiter{}, time.Minute, time.Minute, 10, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 1_000}
+	input := CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", ClientUploadID: uuid.New()}
+	first, err := service.CreateUpload(context.Background(), scope, input)
+	require.NoError(t, err)
+	second, err := service.CreateUpload(context.Background(), scope, input)
+	require.NoError(t, err)
+	require.Equal(t, first.MediaID, second.MediaID)
+	require.Len(t, repo.records, 1)
 }

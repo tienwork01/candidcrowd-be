@@ -139,6 +139,8 @@ type uploadRequest struct {
 	Filename          string `json:"filename" binding:"required,max=255"`
 	MIMEType          string `json:"mime_type" binding:"required,max=100"`
 	Size              int64  `json:"size" binding:"gt=0"`
+	ChecksumSHA256    string `json:"checksum_sha256" binding:"required,len=64,hexadecimal"`
+	ClientUploadID    string `json:"client_upload_id" binding:"required,uuid4"`
 	GuestSessionToken string `json:"guest_session_token" binding:"required"`
 }
 
@@ -157,18 +159,29 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 		apierror.Respond(c, apierror.New(http.StatusUnauthorized, "invalid_guest_session", "guest session is invalid or expired"))
 		return
 	}
+	clientUploadID, err := uuid.Parse(req.ClientUploadID)
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", "client_upload_id must be a UUID"))
+		return
+	}
 	target, err := h.media.CreateUpload(c.Request.Context(), media.UploadScope{
 		EventID:        evt.ID,
 		GuestSessionID: session.ID,
 		Accepting:      evt.Status == event.StatusActive,
 		MaxEventBytes:  evt.MaxMediaBytes,
 	}, media.CreateInput{
-		Filename:     req.Filename,
-		MIMEType:     req.MIMEType,
-		Size:         req.Size,
-		SessionToken: req.GuestSessionToken,
+		Filename:       req.Filename,
+		MIMEType:       req.MIMEType,
+		Size:           req.Size,
+		ChecksumSHA256: req.ChecksumSHA256,
+		ClientUploadID: clientUploadID,
+		SessionToken:   req.GuestSessionToken,
 	})
 	if err != nil {
+		if errors.Is(err, media.ErrDuplicate) {
+			apierror.Respond(c, apierror.New(http.StatusConflict, "duplicate_media", "this file has already been uploaded to this event"))
+			return
+		}
 		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_not_allowed", err.Error()))
 		return
 	}
@@ -207,6 +220,8 @@ func (h *PublicHandler) Complete(c *gin.Context) {
 	}, id); err != nil {
 		if errors.Is(err, media.ErrNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "upload not found"))
+		} else if errors.Is(err, media.ErrDuplicate) {
+			apierror.Respond(c, apierror.New(http.StatusConflict, "duplicate_media", "this file has already been uploaded to this event"))
 		} else {
 			apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_verification_failed", err.Error()))
 		}

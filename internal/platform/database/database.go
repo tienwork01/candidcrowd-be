@@ -9,7 +9,7 @@ import (
 )
 
 func Open(url string, maxOpen, maxIdle int, lifetime time.Duration) (*gorm.DB, *sql.DB, error) {
-	db, err := gorm.Open(postgres.Open(url), &gorm.Config{})
+	db, err := gorm.Open(postgres.Open(url), &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, nil, err
 	}

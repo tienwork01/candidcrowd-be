@@ -27,9 +27,15 @@ type Media struct {
 	MIMEType         string
 	ExpectedSize     int64
 	ActualSize       *int64
-	Status           Status `gorm:"type:media_status"`
-	CreatedAt        time.Time
-	UploadedAt       *time.Time
+	ChecksumSHA256   string `gorm:"column:checksum_sha256"`
+	// ClientUploadID is generated once by the browser and makes target creation
+	// safe to retry when a response is lost on a flaky connection.
+	ClientUploadID *uuid.UUID `gorm:"column:client_upload_id"`
+	Status         Status     `gorm:"type:media_status"`
+	CreatedAt      time.Time
+	LastActivityAt time.Time
+	UploadedAt     *time.Time
+	FailedAt       *time.Time
 }
 
 // PublicView deliberately contains no provider URL, bucket, or object key.

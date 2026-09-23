@@ -49,6 +49,21 @@ func (r *MediaRepository) ReserveUpload(ctx context.Context, record media.Media,
 	})
 }
 
+func (r *MediaRepository) FindByClientUpload(ctx context.Context, eventID, sessionID, clientUploadID uuid.UUID) (media.Media, error) {
+	var record media.Media
+	err := r.db.WithContext(ctx).Where("event_id = ? AND guest_session_id = ? AND client_upload_id = ?", eventID, sessionID, clientUploadID).First(&record).Error
+	return record, mapMediaNotFound(err)
+}
+
+func (r *MediaRepository) HasReadyChecksum(ctx context.Context, eventID uuid.UUID, checksumSHA256 string) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).
+		Model(&media.Media{}).
+		Where("event_id = ? AND checksum_sha256 = ? AND status = ?", eventID, checksumSHA256, media.StatusReady).
+		Count(&count).Error
+	return count > 0, err
+}
+
 func (r *MediaRepository) Delete(ctx context.Context, mediaID uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&media.Media{}, "id = ?", mediaID).Error
 }
@@ -56,7 +71,7 @@ func (r *MediaRepository) Delete(ctx context.Context, mediaID uuid.UUID) error {
 func (r *MediaRepository) FindUploadForSession(ctx context.Context, mediaID, eventID, sessionID uuid.UUID) (media.Media, error) {
 	var record media.Media
 	err := r.db.WithContext(ctx).
-		Where("id = ? AND event_id = ? AND guest_session_id = ? AND status IN ?", mediaID, eventID, sessionID, []media.Status{media.StatusPending, media.StatusUploading, media.StatusUploaded}).
+		Where("id = ? AND event_id = ? AND guest_session_id = ? AND status IN ?", mediaID, eventID, sessionID, []media.Status{media.StatusPending, media.StatusUploading, media.StatusUploaded, media.StatusReady}).
 		First(&record).Error
 	return record, mapMediaNotFound(err)
 }
@@ -65,8 +80,11 @@ func (r *MediaRepository) MarkReady(ctx context.Context, eventID, mediaID uuid.U
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&media.Media{}).
 			Where("id = ? AND event_id = ? AND status IN ?", mediaID, eventID, []media.Status{media.StatusPending, media.StatusUploading, media.StatusUploaded}).
-			Updates(map[string]any{"status": media.StatusReady, "actual_size": actualSize, "uploaded_at": uploadedAt})
+			Updates(map[string]any{"status": media.StatusReady, "actual_size": actualSize, "uploaded_at": uploadedAt, "last_activity_at": uploadedAt})
 		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrDuplicatedKey) {
+				return media.ErrDuplicate
+			}
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
@@ -74,6 +92,17 @@ func (r *MediaRepository) MarkReady(ctx context.Context, eventID, mediaID uuid.U
 		}
 		return tx.Model(&event.Event{}).Where("id = ?", eventID).UpdateColumn("used_media_bytes", gorm.Expr("used_media_bytes + ?", actualSize)).Error
 	})
+}
+
+func (r *MediaRepository) FindStale(ctx context.Context, before time.Time, limit int) ([]media.Media, error) {
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	var records []media.Media
+	err := r.db.WithContext(ctx).
+		Where("status IN ? AND last_activity_at < ?", []media.Status{media.StatusPending, media.StatusUploading, media.StatusUploaded}, before).
+		Order("last_activity_at ASC").Limit(limit).Find(&records).Error
+	return records, err
 }
 
 func (r *MediaRepository) ListReady(ctx context.Context, eventID uuid.UUID, limit int, before *media.Cursor) ([]media.Media, error) {
