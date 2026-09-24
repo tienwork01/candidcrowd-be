@@ -10,6 +10,7 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 type Handler struct {
@@ -26,6 +27,16 @@ type createRequest struct {
 	EventType          string     `json:"event_type" binding:"omitempty,max=80"`
 	EventDate          *time.Time `json:"event_date"`
 	ExpectedGuestCount int        `json:"expected_guest_count" binding:"gte=0"`
+}
+
+type updateRequest struct {
+	Name               *string         `json:"name" binding:"omitempty,max=200"`
+	EventType          *string         `json:"event_type" binding:"omitempty,max=80"`
+	EventDate          *time.Time      `json:"event_date"`
+	ClearEventDate     bool            `json:"clear_event_date"`
+	ExpectedGuestCount *int            `json:"expected_guest_count" binding:"omitempty,gte=0"`
+	GalleryEnabled     *bool           `json:"gallery_enabled"`
+	GuestTheme         *datatypes.JSON `json:"guest_theme"`
 }
 
 func (h *Handler) Create(c *gin.Context) {
@@ -134,4 +145,45 @@ func (h *Handler) Get(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, evt)
+}
+
+func (h *Handler) Update(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
+		return
+	}
+	var req updateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", err.Error()))
+		return
+	}
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	view, err := h.profiles.Me(c.Request.Context(), identity)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	updated, err := h.service.Update(c.Request.Context(), id, view.ID, UpdateInput{
+		Name:               req.Name,
+		EventType:          req.EventType,
+		EventDate:          req.EventDate,
+		ClearEventDate:     req.ClearEventDate,
+		ExpectedGuestCount: req.ExpectedGuestCount,
+		GalleryEnabled:     req.GalleryEnabled,
+		GuestTheme:         req.GuestTheme,
+	})
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
+		} else {
+			apierror.Respond(c, apierror.New(http.StatusBadRequest, "update_failed", err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, updated)
 }

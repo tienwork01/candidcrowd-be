@@ -60,6 +60,7 @@ func (h *PublicHandler) Event(c *gin.Context) {
 		"event_date":      evt.EventDate,
 		"event_type":      evt.EventType,
 		"gallery_enabled": evt.GalleryEnabled,
+		"guest_theme":     evt.GuestTheme,
 	})
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"gorm.io/datatypes"
 )
 
 type inMemoryEventRepo struct {
@@ -161,6 +162,38 @@ func (r *inMemoryEventRepo) GetPublic(ctx context.Context, slug string) (Event, 
 		}
 	}
 	return Event{}, ErrNotFound
+}
+
+func (r *inMemoryEventRepo) UpdateOwned(ctx context.Context, id, hostID uuid.UUID, updates map[string]interface{}) (Event, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.events[id]
+	if !ok || e.HostID != hostID {
+		return Event{}, ErrNotFound
+	}
+	if name, ok := updates["name"].(string); ok {
+		e.Name = name
+	}
+	if eventType, ok := updates["event_type"].(string); ok {
+		e.EventType = eventType
+	}
+	if date, ok := updates["event_date"].(*time.Time); ok {
+		e.EventDate = date
+	}
+	if count, ok := updates["expected_guest_count"].(int); ok {
+		e.ExpectedGuestCount = count
+	}
+	if gallery, ok := updates["gallery_enabled"].(bool); ok {
+		e.GalleryEnabled = gallery
+	}
+	if theme, ok := updates["guest_theme"].(*datatypes.JSON); ok {
+		e.GuestTheme = theme
+	}
+	if updated, ok := updates["updated_at"].(time.Time); ok {
+		e.UpdatedAt = updated
+	}
+	r.events[id] = e
+	return e, nil
 }
 
 func TestEventCreateAndIsolation(t *testing.T) {
@@ -529,4 +562,36 @@ func (r *testProfileRepo) HasRequiredConsents(ctx context.Context, userID uuid.U
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.consents[userID], nil
+}
+
+func TestService_Update_GuestTheme(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	svc := NewService(repo, 100*1024*1024)
+	ctx := context.Background()
+	hostID := uuid.New()
+
+	created, err := svc.Create(ctx, hostID, CreateInput{
+		Name:               "Original Wedding",
+		EventType:          "wedding",
+		ExpectedGuestCount: 100,
+	})
+	require.NoError(t, err)
+
+	themeJSON := datatypes.JSON([]byte(`{"presetId":"botanical","primaryColor":"#2d5a3f"}`))
+	newName := "Updated Botanical Wedding"
+	newCount := 150
+	gallery := false
+
+	updated, err := svc.Update(ctx, created.ID, hostID, UpdateInput{
+		Name:               &newName,
+		ExpectedGuestCount: &newCount,
+		GalleryEnabled:     &gallery,
+		GuestTheme:         &themeJSON,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "Updated Botanical Wedding", updated.Name)
+	require.Equal(t, 150, updated.ExpectedGuestCount)
+	require.False(t, updated.GalleryEnabled)
+	require.NotNil(t, updated.GuestTheme)
+	require.JSONEq(t, `{"presetId":"botanical","primaryColor":"#2d5a3f"}`, string(*updated.GuestTheme))
 }

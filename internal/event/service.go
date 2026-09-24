@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 type Service struct {
@@ -23,6 +24,16 @@ type CreateInput struct {
 	Name, EventType    string
 	EventDate          *time.Time
 	ExpectedGuestCount int
+}
+
+type UpdateInput struct {
+	Name               *string
+	EventType          *string
+	EventDate          *time.Time
+	ClearEventDate     bool
+	ExpectedGuestCount *int
+	GalleryEnabled     *bool
+	GuestTheme         *datatypes.JSON
 }
 
 type ListInput struct {
@@ -115,6 +126,41 @@ func (s *Service) GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, er
 
 func (s *Service) GetPublic(ctx context.Context, slug string) (Event, error) {
 	return s.repo.GetPublic(ctx, slug)
+}
+
+func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInput) (Event, error) {
+	updates := make(map[string]interface{})
+	if in.Name != nil {
+		trimmed := strings.TrimSpace(*in.Name)
+		if trimmed == "" {
+			return Event{}, fmt.Errorf("event name cannot be empty")
+		}
+		updates["name"] = trimmed
+	}
+	if in.EventType != nil {
+		updates["event_type"] = defaultType(*in.EventType)
+	}
+	if in.ClearEventDate {
+		updates["event_date"] = nil
+	} else if in.EventDate != nil {
+		updates["event_date"] = in.EventDate
+	}
+	if in.ExpectedGuestCount != nil {
+		if *in.ExpectedGuestCount < 0 {
+			return Event{}, fmt.Errorf("expected guest count cannot be negative")
+		}
+		updates["expected_guest_count"] = *in.ExpectedGuestCount
+	}
+	if in.GalleryEnabled != nil {
+		updates["gallery_enabled"] = *in.GalleryEnabled
+	}
+	if in.GuestTheme != nil {
+		updates["guest_theme"] = in.GuestTheme
+	}
+	if len(updates) > 0 {
+		updates["updated_at"] = time.Now().UTC()
+	}
+	return s.repo.UpdateOwned(ctx, id, hostID, updates)
 }
 
 func defaultType(eventType string) string {

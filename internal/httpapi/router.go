@@ -55,6 +55,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	host.POST("", cfg.Events.Create)
 	host.GET("", cfg.Events.List)
 	host.GET("/:id", cfg.Events.Get)
+	host.PATCH("/:id", cfg.Events.Update)
 
 	pub := api.Group("/public/events/:slug")
 	pub.GET("", cfg.Public.Event)

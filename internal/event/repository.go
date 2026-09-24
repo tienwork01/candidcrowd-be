@@ -23,6 +23,7 @@ type Repository interface {
 	ListByHost(ctx context.Context, hostID uuid.UUID, filter ListFilter) ([]Event, int64, error)
 	GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, error)
 	GetPublic(ctx context.Context, slug string) (Event, error)
+	UpdateOwned(ctx context.Context, id, hostID uuid.UUID, updates map[string]interface{}) (Event, error)
 }
 
 type gormRepository struct {
@@ -110,6 +111,20 @@ func (r *gormRepository) GetPublic(ctx context.Context, slug string) (Event, err
 	var evt Event
 	err := r.db.WithContext(ctx).Where("slug = ? AND status = ?", slug, StatusActive).First(&evt).Error
 	return evt, mapNotFound(err)
+}
+
+func (r *gormRepository) UpdateOwned(ctx context.Context, id, hostID uuid.UUID, updates map[string]interface{}) (Event, error) {
+	if len(updates) == 0 {
+		return r.GetOwned(ctx, id, hostID)
+	}
+	res := r.db.WithContext(ctx).Model(&Event{}).Where("id = ? AND host_id = ?", id, hostID).Updates(updates)
+	if res.Error != nil {
+		return Event{}, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return Event{}, ErrNotFound
+	}
+	return r.GetOwned(ctx, id, hostID)
 }
 
 func mapNotFound(err error) error {
