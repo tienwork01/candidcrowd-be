@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type inMemoryProfileRepo struct {
@@ -57,6 +58,35 @@ func (r *inMemoryProfileRepo) EnsureUser(ctx context.Context, identity auth.Iden
 	}
 	r.users[identity.BetterAuthUserID] = u
 	return u, nil
+}
+
+func (r *inMemoryProfileRepo) FindUserID(_ context.Context, betterAuthUserID string) (uuid.UUID, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	u, ok := r.users[betterAuthUserID]
+	if !ok {
+		return uuid.Nil, gorm.ErrRecordNotFound
+	}
+	return u.ID, nil
+}
+
+func TestProfileServiceUserIDMaterializesMissingProfile(t *testing.T) {
+	repo := newInMemoryProfileRepo()
+	svc := NewService(repo, "2026-01", "2026-01")
+	identity := auth.Identity{
+		BetterAuthUserID: "ba_user_" + uuid.NewString(),
+		Email:            "host@example.com",
+		Name:             "Host",
+		EmailVerified:    true,
+	}
+
+	id, err := svc.UserID(context.Background(), identity)
+
+	require.NoError(t, err)
+	require.NotEqual(t, uuid.Nil, id)
+	stored, err := repo.FindUserID(context.Background(), identity.BetterAuthUserID)
+	require.NoError(t, err)
+	require.Equal(t, id, stored)
 }
 
 func (r *inMemoryProfileRepo) SaveConsents(ctx context.Context, consents []Consent) error {

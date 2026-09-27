@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ListFilter struct {
@@ -24,6 +25,7 @@ type Repository interface {
 	GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, error)
 	GetPublic(ctx context.Context, slug string) (Event, error)
 	UpdateOwned(ctx context.Context, id, hostID uuid.UUID, updates map[string]interface{}) (Event, error)
+	DeleteOwned(ctx context.Context, id, hostID uuid.UUID) error
 }
 
 type gormRepository struct {
@@ -39,7 +41,7 @@ func (r *gormRepository) Create(ctx context.Context, event *Event) error {
 }
 
 func (r *gormRepository) ListByHost(ctx context.Context, hostID uuid.UUID, filter ListFilter) ([]Event, int64, error) {
-	db := r.db.WithContext(ctx).Model(&Event{}).Where("host_id = ?", hostID)
+	db := r.db.WithContext(ctx).Model(&Event{}).Where("host_id = ? AND status <> ?", hostID, StatusDeleted)
 
 	if q := strings.TrimSpace(filter.Query); q != "" {
 		likePattern := "%" + q + "%"
@@ -103,7 +105,7 @@ func (r *gormRepository) ListByHost(ctx context.Context, hostID uuid.UUID, filte
 
 func (r *gormRepository) GetOwned(ctx context.Context, id, hostID uuid.UUID) (Event, error) {
 	var evt Event
-	err := r.db.WithContext(ctx).Where("id = ? AND host_id = ?", id, hostID).First(&evt).Error
+	err := r.db.WithContext(ctx).Where("id = ? AND host_id = ? AND status <> ?", id, hostID, StatusDeleted).First(&evt).Error
 	return evt, mapNotFound(err)
 }
 
@@ -117,14 +119,33 @@ func (r *gormRepository) UpdateOwned(ctx context.Context, id, hostID uuid.UUID, 
 	if len(updates) == 0 {
 		return r.GetOwned(ctx, id, hostID)
 	}
-	res := r.db.WithContext(ctx).Model(&Event{}).Where("id = ? AND host_id = ?", id, hostID).Updates(updates)
+	// RETURNING reads back the row this statement wrote, rather than issuing a
+	// second SELECT that a concurrent update could answer differently.
+	var updated Event
+	res := r.db.WithContext(ctx).Model(&updated).
+		Clauses(clause.Returning{}).
+		Where("id = ? AND host_id = ? AND status <> ?", id, hostID, StatusDeleted).
+		Updates(updates)
 	if res.Error != nil {
 		return Event{}, res.Error
 	}
 	if res.RowsAffected == 0 {
 		return Event{}, ErrNotFound
 	}
-	return r.GetOwned(ctx, id, hostID)
+	return updated, nil
+}
+
+func (r *gormRepository) DeleteOwned(ctx context.Context, id, hostID uuid.UUID) error {
+	result := r.db.WithContext(ctx).Model(&Event{}).
+		Where("id = ? AND host_id = ? AND status <> ?", id, hostID, StatusDeleted).
+		Updates(map[string]interface{}{"status": StatusDeleted, "gallery_enabled": false})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func mapNotFound(err error) error {

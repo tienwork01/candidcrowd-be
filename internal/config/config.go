@@ -54,6 +54,26 @@ type Config struct {
 	StaleUploadAge      time.Duration
 	StaleUploadSchedule string
 
+	// Background workers. Enabled by default so an existing single-process
+	// deployment is unchanged; set RUN_WORKER=false on request-serving replicas
+	// once a dedicated worker replica is deployed.
+	RunWorker              bool
+	MediaWorkerConcurrency int
+	MediaWorkerIdle        time.Duration
+	ExportIdle             time.Duration
+	AnalyticsCacheTTL      time.Duration
+
+	// Realtime (SSE). Disabling it unmounts the stream routes and leaves the
+	// rest of the API untouched.
+	RealtimeEnabled       bool
+	RealtimeBuffer        int
+	RealtimeHeartbeat     time.Duration
+	RealtimeStreamMaxAge  time.Duration
+	RealtimeRetry         time.Duration
+	RealtimeMaxPerEvent   int
+	RealtimeConnectRate   int
+	RealtimeConnectWindow time.Duration
+
 	// Weekly Google Drive archive. All values are environment supplied.
 	DailyArchiveEnabled   bool
 	DailyArchiveSchedule  string
@@ -148,6 +168,21 @@ func Load() (Config, error) {
 		RateWindow:          parseDuration("UPLOAD_RATE_WINDOW", "1m"),
 		StaleUploadAge:      parseDuration("UPLOAD_STALE_AGE", "24h"),
 		StaleUploadSchedule: str("UPLOAD_STALE_CLEANUP_SCHEDULE", "*/15 * * * *"),
+
+		RunWorker:              parseBool("RUN_WORKER", true),
+		MediaWorkerConcurrency: parseInt("MEDIA_WORKER_CONCURRENCY", 2),
+		MediaWorkerIdle:        parseDuration("MEDIA_WORKER_IDLE", "5s"),
+		ExportIdle:             parseDuration("EXPORT_WORKER_IDLE", "5s"),
+		AnalyticsCacheTTL:      parseDuration("ANALYTICS_CACHE_TTL", "30s"),
+
+		RealtimeEnabled:       parseBool("REALTIME_ENABLED", true),
+		RealtimeBuffer:        parseInt("REALTIME_CLIENT_BUFFER", 32),
+		RealtimeHeartbeat:     parseDuration("REALTIME_HEARTBEAT", "20s"),
+		RealtimeStreamMaxAge:  parseDuration("REALTIME_STREAM_MAX_AGE", "30m"),
+		RealtimeRetry:         parseDuration("REALTIME_RETRY", "3s"),
+		RealtimeMaxPerEvent:   parseInt("REALTIME_MAX_CONNECTIONS_PER_EVENT", 500),
+		RealtimeConnectRate:   parseInt("REALTIME_CONNECT_RATE", 30),
+		RealtimeConnectWindow: parseDuration("REALTIME_CONNECT_WINDOW", "1m"),
 
 		DailyArchiveEnabled:   parseBool("MEDIA_DAILY_ARCHIVE_ENABLED", false),
 		DailyArchiveSchedule:  str("MEDIA_DAILY_ARCHIVE_SCHEDULE", "0 2 * * *"),

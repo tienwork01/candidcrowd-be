@@ -47,7 +47,7 @@ func (r *inMemoryEventRepo) ListByHost(ctx context.Context, hostID uuid.UUID, fi
 	var matches []Event
 	q := strings.ToLower(strings.TrimSpace(filter.Query))
 	for _, e := range r.events {
-		if e.HostID != hostID {
+		if e.HostID != hostID || e.Status == StatusDeleted {
 			continue
 		}
 		if q != "" {
@@ -147,7 +147,7 @@ func (r *inMemoryEventRepo) GetOwned(ctx context.Context, id, hostID uuid.UUID) 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.events[id]
-	if !ok || e.HostID != hostID {
+	if !ok || e.HostID != hostID || e.Status == StatusDeleted {
 		return Event{}, ErrNotFound
 	}
 	return e, nil
@@ -194,6 +194,19 @@ func (r *inMemoryEventRepo) UpdateOwned(ctx context.Context, id, hostID uuid.UUI
 	}
 	r.events[id] = e
 	return e, nil
+}
+
+func (r *inMemoryEventRepo) DeleteOwned(_ context.Context, id, hostID uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.events[id]
+	if !ok || e.HostID != hostID || e.Status == StatusDeleted {
+		return ErrNotFound
+	}
+	e.Status = StatusDeleted
+	e.GalleryEnabled = false
+	r.events[id] = e
+	return nil
 }
 
 func TestEventCreateAndIsolation(t *testing.T) {
@@ -267,6 +280,23 @@ func TestEventCreateValidation(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected guest count cannot be negative")
+}
+
+func TestEventDeleteIsHostScopedAndRemovesPublicAccess(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	svc := NewService(repo, 100*1024*1024)
+	ctx := context.Background()
+	hostID := uuid.New()
+	otherHostID := uuid.New()
+
+	created, err := svc.Create(ctx, hostID, CreateInput{Name: "To remove"})
+	require.NoError(t, err)
+	require.ErrorIs(t, svc.Delete(ctx, created.ID, otherHostID), ErrNotFound)
+	require.NoError(t, svc.Delete(ctx, created.ID, hostID))
+	_, err = svc.GetOwned(ctx, created.ID, hostID)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = svc.GetPublic(ctx, created.Slug)
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestEventHandlerCreateGate(t *testing.T) {
@@ -547,6 +577,12 @@ func (r *testProfileRepo) EnsureUser(ctx context.Context, identity auth.Identity
 		DisplayName:      identity.Name,
 		EmailVerifiedAt:  verifiedAt,
 	}, nil
+}
+
+func (r *testProfileRepo) FindUserID(_ context.Context, betterAuthUserID string) (uuid.UUID, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.users[betterAuthUserID], nil
 }
 
 func (r *testProfileRepo) SaveConsents(ctx context.Context, consents []profile.Consent) error {

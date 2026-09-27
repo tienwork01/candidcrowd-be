@@ -54,9 +54,19 @@ func (r *ArchiveRepository) RecordVerified(ctx context.Context, mediaID uuid.UUI
 }
 
 func (r *ArchiveRepository) MarkSourceDeleted(ctx context.Context, mediaID uuid.UUID, objectKey string, deletedAt time.Time) error {
-	return r.db.WithContext(ctx).Exec(`
-		INSERT INTO storage_replicas (media_id, provider, location_reference, state, deleted_at)
-		VALUES (?, 'r2', ?, 'deleted', ?)
-		ON CONFLICT (media_id, provider, location_reference)
-		DO UPDATE SET state = 'deleted', deleted_at = EXCLUDED.deleted_at`, mediaID, objectKey, deletedAt).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			INSERT INTO storage_replicas (media_id, provider, location_reference, state, deleted_at)
+			VALUES (?, 'r2', ?, 'deleted', ?)
+			ON CONFLICT (media_id, provider, location_reference)
+			DO UPDATE SET state = 'deleted', deleted_at = EXCLUDED.deleted_at`, mediaID, objectKey, deletedAt).Error; err != nil {
+			return err
+		}
+		// The gallery endpoints read this flag to decide whether a record can
+		// still be served by a presigned link. It is written in the same
+		// transaction as the replica state so a listing can never sign a key
+		// whose object has already been deleted.
+		return tx.Exec(`UPDATE media SET source_deleted_at = ? WHERE id = ? AND source_deleted_at IS NULL`,
+			deletedAt, mediaID).Error
+	})
 }

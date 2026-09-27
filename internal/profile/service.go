@@ -2,9 +2,12 @@ package profile
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type Service struct {
@@ -15,6 +18,23 @@ type Service struct {
 
 func NewService(repo Repository, termsVersion, privacyVersion string) *Service {
 	return &Service{repo: repo, termsVersion: termsVersion, privacyVersion: privacyVersion}
+}
+
+// UserID resolves an authenticated host. Older sessions can predate the
+// product-profile row, so a missing row is materialized once rather than
+// escaping as a raw GORM error and becoming an HTTP 500 on host actions.
+func (s *Service) UserID(ctx context.Context, identity auth.Identity) (uuid.UUID, error) {
+	id, err := s.repo.FindUserID(ctx, identity.BetterAuthUserID)
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return id, err
+	}
+
+	u, err := s.repo.EnsureUser(ctx, identity)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	return u.ID, nil
 }
 
 func (s *Service) Me(ctx context.Context, identity auth.Identity) (View, error) {

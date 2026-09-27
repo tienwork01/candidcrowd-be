@@ -3,6 +3,7 @@ package archive
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -79,4 +80,41 @@ func TestRunArchivesAndRetriesSourceDeletionWithoutInfrastructure(t *testing.T) 
 	require.True(t, repo.deleted[archivedID])
 	require.True(t, repo.deleted[retryID])
 	require.ElementsMatch(t, []string{"r2/retry.jpg", "r2/new.jpg"}, source.deleted)
+}
+
+// poisonSource fails to delete one specific key.
+type poisonSource struct {
+	memorySource
+	poison string
+}
+
+func (s *poisonSource) Delete(ctx context.Context, key string) error {
+	if key == s.poison {
+		return errors.New("provider rejected the delete")
+	}
+	return s.memorySource.Delete(ctx, key)
+}
+
+// ListSourceDeletionPending orders by verified_at, so a candidate that always
+// fails stays at the head of every batch. Stopping the run on it would stall
+// archiving for the whole deployment indefinitely.
+func TestRunContinuesPastAFailingCandidate(t *testing.T) {
+	stuckID, healthyID := uuid.New(), uuid.New()
+	repo := &memoryArchiveRepository{
+		pending: []Candidate{
+			{ID: stuckID, ObjectKey: "r2/stuck.jpg"},
+			{ID: healthyID, ObjectKey: "r2/healthy.jpg"},
+		},
+		verified: map[uuid.UUID]string{}, deleted: map[uuid.UUID]bool{},
+	}
+	source := &poisonSource{poison: "r2/stuck.jpg"}
+	target := &memoryTarget{objects: map[string][]byte{}}
+
+	err := New(repo, source, target).Run(context.Background(), 50)
+	require.Error(t, err, "the run must report the failure")
+	require.Contains(t, err.Error(), "1 of 2")
+
+	require.False(t, repo.deleted[stuckID])
+	require.True(t, repo.deleted[healthyID], "the healthy candidate must still be processed")
+	require.Equal(t, []string{"r2/healthy.jpg"}, source.deleted)
 }

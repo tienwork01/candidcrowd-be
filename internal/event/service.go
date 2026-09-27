@@ -11,13 +11,36 @@ import (
 	"gorm.io/datatypes"
 )
 
+// Change describes event settings a connected browser reacts to. A guest page
+// must learn that the gallery was switched off or the mode changed without
+// being reloaded.
+type Change struct {
+	EventID        uuid.UUID `json:"-"`
+	GalleryEnabled bool      `json:"gallery_enabled"`
+	EventMode      string    `json:"event_mode"`
+	Status         Status    `json:"status"`
+}
+
+// Notifier receives changes for broadcast. Implementations must return
+// promptly; any network work belongs out of band.
+type Notifier interface {
+	EventChanged(ctx context.Context, change Change)
+}
+
 type Service struct {
 	repo          Repository
 	eventMaxBytes int64
+	notifier      Notifier
 }
 
-func NewService(repo Repository, eventMaxBytes int64) *Service {
-	return &Service{repo: repo, eventMaxBytes: eventMaxBytes}
+// NewService takes an optional Notifier so realtime broadcast stays a
+// deployment concern rather than a precondition for managing events.
+func NewService(repo Repository, eventMaxBytes int64, notifiers ...Notifier) *Service {
+	s := &Service{repo: repo, eventMaxBytes: eventMaxBytes}
+	if len(notifiers) > 0 {
+		s.notifier = notifiers[0]
+	}
+	return s
 }
 
 type CreateInput struct {
@@ -27,13 +50,17 @@ type CreateInput struct {
 }
 
 type UpdateInput struct {
-	Name               *string
-	EventType          *string
-	EventDate          *time.Time
-	ClearEventDate     bool
-	ExpectedGuestCount *int
-	GalleryEnabled     *bool
-	GuestTheme         *datatypes.JSON
+	Name                *string
+	EventType           *string
+	EventDate           *time.Time
+	ClearEventDate      bool
+	ExpectedGuestCount  *int
+	GalleryEnabled      *bool
+	EventMode           *string
+	LifecyclePhase      *string
+	SetupChecklist      *datatypes.JSON
+	CandidCameraEnabled *bool
+	GuestTheme          *datatypes.JSON
 }
 
 type ListInput struct {
@@ -128,6 +155,10 @@ func (s *Service) GetPublic(ctx context.Context, slug string) (Event, error) {
 	return s.repo.GetPublic(ctx, slug)
 }
 
+func (s *Service) Delete(ctx context.Context, id, hostID uuid.UUID) error {
+	return s.repo.DeleteOwned(ctx, id, hostID)
+}
+
 func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInput) (Event, error) {
 	updates := make(map[string]interface{})
 	if in.Name != nil {
@@ -154,13 +185,39 @@ func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInp
 	if in.GalleryEnabled != nil {
 		updates["gallery_enabled"] = *in.GalleryEnabled
 	}
+	if in.EventMode != nil {
+		updates["event_mode"] = strings.TrimSpace(*in.EventMode)
+	}
+	if in.LifecyclePhase != nil {
+		updates["lifecycle_phase"] = strings.TrimSpace(*in.LifecyclePhase)
+	}
+	if in.SetupChecklist != nil {
+		updates["setup_checklist"] = in.SetupChecklist
+	}
+	if in.CandidCameraEnabled != nil {
+		updates["candid_camera_enabled"] = *in.CandidCameraEnabled
+	}
 	if in.GuestTheme != nil {
 		updates["guest_theme"] = in.GuestTheme
 	}
 	if len(updates) > 0 {
 		updates["updated_at"] = time.Now().UTC()
 	}
-	return s.repo.UpdateOwned(ctx, id, hostID, updates)
+	updated, err := s.repo.UpdateOwned(ctx, id, hostID, updates)
+	if err != nil {
+		return Event{}, err
+	}
+	// Only settings a live page reacts to are broadcast. Renaming an event or
+	// editing its checklist changes nothing a connected browser must redraw.
+	if s.notifier != nil && (in.GalleryEnabled != nil || in.EventMode != nil) {
+		s.notifier.EventChanged(ctx, Change{
+			EventID:        updated.ID,
+			GalleryEnabled: updated.GalleryEnabled,
+			EventMode:      updated.EventMode,
+			Status:         updated.Status,
+		})
+	}
+	return updated, nil
 }
 
 func defaultType(eventType string) string {

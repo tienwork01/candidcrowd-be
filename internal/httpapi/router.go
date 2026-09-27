@@ -24,7 +24,14 @@ type RouterConfig struct {
 	DatabaseReady  func(context.Context) error
 	Profiles       *profile.Handler
 	Events         *event.Handler
+	HostMedia      *HostMediaHandler
+	Insights       *InsightsHandler
+	Exports        *ExportHandler
+	LiveWall       *LiveWallHandler
 	Public         *PublicHandler
+	// Stream is nil when realtime is disabled for the deployment, in which
+	// case the stream routes are simply not mounted.
+	Stream *StreamHandler
 }
 
 func NewRouter(cfg RouterConfig) *gin.Engine {
@@ -56,14 +63,40 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	host.GET("", cfg.Events.List)
 	host.GET("/:id", cfg.Events.Get)
 	host.PATCH("/:id", cfg.Events.Update)
+	host.DELETE("/:id", cfg.Events.Delete)
+	host.POST("/:id/exports", cfg.Exports.Create)
+	host.GET("/:id/exports/:exportId", cfg.Exports.Get)
+	host.GET("/:id/analytics", cfg.Insights.Analytics)
+	host.GET("/:id/qr-sources", cfg.Insights.ListSources)
+	host.POST("/:id/qr-sources", cfg.Insights.CreateSource)
+	host.PATCH("/:id/qr-sources/:sourceId", cfg.Insights.UpdateSource)
+	host.DELETE("/:id/qr-sources/:sourceId", cfg.Insights.DeleteSource)
+	host.GET("/:id/media", cfg.HostMedia.List)
+	host.GET("/:id/media/:mediaId/content", cfg.HostMedia.Content)
+	host.PATCH("/:id/media/:mediaId", cfg.HostMedia.UpdateStatus)
+	host.POST("/:id/media/batch-status", cfg.HostMedia.BatchUpdateStatus)
+	host.DELETE("/:id/media/:mediaId", cfg.HostMedia.Delete)
+	host.POST("/:id/media/batch-delete", cfg.HostMedia.BatchDelete)
+	host.POST("/:id/live-wall-sessions", cfg.LiveWall.Create)
+	host.GET("/:id/live-wall-sessions/:sessionId", cfg.LiveWall.Get)
+	host.PATCH("/:id/live-wall-sessions/:sessionId", cfg.LiveWall.Update)
+	host.POST("/:id/live-wall-sessions/:sessionId/end", cfg.LiveWall.End)
+	host.POST("/:id/live-wall-sessions/:sessionId/commands", cfg.LiveWall.Command)
 
 	pub := api.Group("/public/events/:slug")
 	pub.GET("", cfg.Public.Event)
+	if cfg.Stream != nil {
+		host.GET("/:id/stream", cfg.Stream.Host)
+		pub.GET("/stream", cfg.Stream.Public)
+	}
 	pub.GET("/media", cfg.Public.Media)
 	pub.GET("/media/:mediaId/content", cfg.Public.MediaContent)
 	pub.POST("/sessions", cfg.Public.CreateSession)
 	pub.POST("/uploads", cfg.Public.CreateUpload)
 	pub.POST("/uploads/:uploadId/complete", cfg.Public.Complete)
+	r.GET("/api/v1/public/live-wall-sessions/:token", cfg.LiveWall.Player)
+	r.GET("/api/v1/public/live-wall-sessions/:token/stream", cfg.LiveWall.Stream)
+	r.GET("/api/v1/public/live-wall-sessions/:token/media/:mediaId/content", cfg.LiveWall.Content)
 
 	return r
 }

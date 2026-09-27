@@ -23,6 +23,11 @@ type Client struct {
 
 type R2 = Client
 
+// Media keys are immutable: a completed upload is never overwritten. Browser
+// caches may therefore retain an object safely, but must not share it through
+// intermediary caches because access is granted by a signed URL.
+const privateMediaCacheControl = "private, max-age=1800"
+
 func New(ctx context.Context, endpoint, region, bucket, accessKey, secret string) (*Client, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region), awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secret, "")))
 	if err != nil {
@@ -33,7 +38,7 @@ func New(ctx context.Context, endpoint, region, bucket, accessKey, secret string
 }
 
 func (c *Client) PresignPut(ctx context.Context, key, mime string, expiry time.Duration) (string, error) {
-	out, err := c.presigner.PresignPutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), ContentType: aws.String(mime)}, s3.WithPresignExpires(expiry))
+	out, err := c.presigner.PresignPutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), ContentType: aws.String(mime), CacheControl: aws.String(privateMediaCacheControl)}, s3.WithPresignExpires(expiry))
 	if err != nil {
 		return "", err
 	}
@@ -41,7 +46,7 @@ func (c *Client) PresignPut(ctx context.Context, key, mime string, expiry time.D
 }
 
 func (c *Client) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
-	out, err := c.presigner.PresignGetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}, s3.WithPresignExpires(expiry))
+	out, err := c.presigner.PresignGetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), ResponseCacheControl: aws.String(privateMediaCacheControl)}, s3.WithPresignExpires(expiry))
 	if err != nil {
 		return "", err
 	}
@@ -61,6 +66,17 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectInfo, error) {
 
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
+	return err
+}
+
+func (c *Client) Put(ctx context.Context, key, mime string, body io.Reader) error {
+	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:       aws.String(c.bucket),
+		Key:          aws.String(key),
+		Body:         body,
+		ContentType:  aws.String(mime),
+		CacheControl: aws.String(privateMediaCacheControl),
+	})
 	return err
 }
 

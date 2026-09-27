@@ -13,8 +13,18 @@ import (
 
 type Repository interface {
 	EnsureUser(ctx context.Context, identity auth.Identity) (user.User, error)
+	FindUserID(ctx context.Context, betterAuthUserID string) (uuid.UUID, error)
 	SaveConsents(ctx context.Context, consents []Consent) error
 	HasRequiredConsents(ctx context.Context, userID uuid.UUID, termsVersion, privacyVersion string) (bool, error)
+}
+
+func (r *gormRepository) FindUserID(ctx context.Context, betterAuthUserID string) (uuid.UUID, error) {
+	var u user.User
+	err := r.db.WithContext(ctx).
+		Where("better_auth_user_id = ?", betterAuthUserID).
+		Select("id").
+		Take(&u).Error
+	return u.ID, err
 }
 
 type gormRepository struct {

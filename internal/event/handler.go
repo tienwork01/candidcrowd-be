@@ -30,13 +30,17 @@ type createRequest struct {
 }
 
 type updateRequest struct {
-	Name               *string         `json:"name" binding:"omitempty,max=200"`
-	EventType          *string         `json:"event_type" binding:"omitempty,max=80"`
-	EventDate          *time.Time      `json:"event_date"`
-	ClearEventDate     bool            `json:"clear_event_date"`
-	ExpectedGuestCount *int            `json:"expected_guest_count" binding:"omitempty,gte=0"`
-	GalleryEnabled     *bool           `json:"gallery_enabled"`
-	GuestTheme         *datatypes.JSON `json:"guest_theme"`
+	Name                *string         `json:"name" binding:"omitempty,max=200"`
+	EventType           *string         `json:"event_type" binding:"omitempty,max=80"`
+	EventDate           *time.Time      `json:"event_date"`
+	ClearEventDate      bool            `json:"clear_event_date"`
+	ExpectedGuestCount  *int            `json:"expected_guest_count" binding:"omitempty,gte=0"`
+	GalleryEnabled      *bool           `json:"gallery_enabled"`
+	EventMode           *string         `json:"event_mode" binding:"omitempty,max=32"`
+	LifecyclePhase      *string         `json:"lifecycle_phase" binding:"omitempty,max=32"`
+	SetupChecklist      *datatypes.JSON `json:"setup_checklist"`
+	CandidCameraEnabled *bool           `json:"candid_camera_enabled"`
+	GuestTheme          *datatypes.JSON `json:"guest_theme"`
 }
 
 func (h *Handler) Create(c *gin.Context) {
@@ -96,12 +100,12 @@ func (h *Handler) List(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
-	view, err := h.profiles.Me(c.Request.Context(), identity)
+	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
 	}
-	output, err := h.service.List(c.Request.Context(), view.ID, ListInput{
+	output, err := h.service.List(c.Request.Context(), hostID, ListInput{
 		Page:      query.Page,
 		PerPage:   query.PerPage,
 		Query:     query.Query,
@@ -130,12 +134,12 @@ func (h *Handler) Get(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
-	view, err := h.profiles.Me(c.Request.Context(), identity)
+	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
 	}
-	evt, err := h.service.GetOwned(c.Request.Context(), id, view.ID)
+	evt, err := h.service.GetOwned(c.Request.Context(), id, hostID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
@@ -163,19 +167,23 @@ func (h *Handler) Update(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
-	view, err := h.profiles.Me(c.Request.Context(), identity)
+	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
 	}
-	updated, err := h.service.Update(c.Request.Context(), id, view.ID, UpdateInput{
-		Name:               req.Name,
-		EventType:          req.EventType,
-		EventDate:          req.EventDate,
-		ClearEventDate:     req.ClearEventDate,
-		ExpectedGuestCount: req.ExpectedGuestCount,
-		GalleryEnabled:     req.GalleryEnabled,
-		GuestTheme:         req.GuestTheme,
+	updated, err := h.service.Update(c.Request.Context(), id, hostID, UpdateInput{
+		Name:                req.Name,
+		EventType:           req.EventType,
+		EventDate:           req.EventDate,
+		ClearEventDate:      req.ClearEventDate,
+		ExpectedGuestCount:  req.ExpectedGuestCount,
+		GalleryEnabled:      req.GalleryEnabled,
+		EventMode:           req.EventMode,
+		LifecyclePhase:      req.LifecyclePhase,
+		SetupChecklist:      req.SetupChecklist,
+		CandidCameraEnabled: req.CandidCameraEnabled,
+		GuestTheme:          req.GuestTheme,
 	})
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -186,4 +194,31 @@ func (h *Handler) Update(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, updated)
+}
+
+func (h *Handler) Delete(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
+		return
+	}
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if err = h.service.Delete(c.Request.Context(), id, hostID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
+		} else {
+			apierror.Respond(c, err)
+		}
+		return
+	}
+	c.Status(http.StatusNoContent)
 }

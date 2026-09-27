@@ -65,9 +65,23 @@ func (s *Service) Run(ctx context.Context, limit int) error {
 	if err != nil {
 		return err
 	}
+	// A candidate that keeps failing sits at the head of every later batch, so
+	// stopping on it would stall archiving for the whole deployment. Each item
+	// is independent; the run reports what it could not finish and moves on.
+	var failures int
+	var firstErr error
+	note := func(err error) {
+		failures++
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	for _, candidate := range pending {
 		if err := s.deleteSource(ctx, candidate); err != nil {
-			return err
+			note(fmt.Errorf("delete archived source %s: %w", candidate.ID, err))
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 	}
 
@@ -77,8 +91,14 @@ func (s *Service) Run(ctx context.Context, limit int) error {
 	}
 	for _, candidate := range candidates {
 		if err := s.archive(ctx, candidate); err != nil {
-			return err
+			note(fmt.Errorf("archive %s: %w", candidate.ID, err))
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("%d of %d archive operations failed: %w", failures, len(pending)+len(candidates), firstErr)
 	}
 	return nil
 }

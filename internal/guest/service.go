@@ -20,7 +20,7 @@ func NewService(repo Repository, ttl time.Duration) *Service {
 	return &Service{repo: repo, ttl: ttl}
 }
 
-func (s *Service) Create(ctx context.Context, eventID uuid.UUID) (Session, string, error) {
+func (s *Service) Create(ctx context.Context, eventID uuid.UUID, source ...*string) (Session, string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return Session{}, "", err
@@ -30,7 +30,11 @@ func (s *Service) Create(ctx context.Context, eventID uuid.UUID) (Session, strin
 	// Generate the primary key in the application rather than relying on the
 	// database default. This keeps inserts portable and avoids a driver-specific
 	// UUID scan from a RETURNING clause.
-	session := Session{ID: uuid.New(), EventID: eventID, TokenHash: hash[:], ExpiresAt: time.Now().Add(s.ttl)}
+	var qrSourceCode *string
+	if len(source) > 0 {
+		qrSourceCode = source[0]
+	}
+	session := Session{ID: uuid.New(), EventID: eventID, QRSourceCode: qrSourceCode, TokenHash: hash[:], ExpiresAt: time.Now().Add(s.ttl)}
 	return session, token, s.repo.Create(ctx, &session)
 }
 

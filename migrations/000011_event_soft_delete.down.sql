@@ -1,0 +1,2 @@
+-- PostgreSQL enum values cannot be removed safely. The status value remains
+-- available if this migration is rolled back.

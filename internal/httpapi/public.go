@@ -1,9 +1,8 @@
 package httpapi
 
 import (
-	"context"
 	"errors"
-	"io"
+
 	"net/http"
 	"strconv"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
+	"github.com/candidcrowd/candidcrowd-backend/internal/insights"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -20,15 +20,12 @@ type PublicHandler struct {
 	events        *event.Service
 	guests        *guest.Service
 	media         *media.Service
-	archiveReader interface {
-		OpenRead(context.Context, string) (io.ReadCloser, error)
-	}
+	insights      *insights.Service
+	archiveReader ArchiveReader
 }
 
-func NewPublicHandler(events *event.Service, guests *guest.Service, media *media.Service, readers ...interface {
-	OpenRead(context.Context, string) (io.ReadCloser, error)
-}) *PublicHandler {
-	h := &PublicHandler{events: events, guests: guests, media: media}
+func NewPublicHandler(events *event.Service, guests *guest.Service, media *media.Service, insightsService *insights.Service, readers ...ArchiveReader) *PublicHandler {
+	h := &PublicHandler{events: events, guests: guests, media: media, insights: insightsService}
 	if len(readers) > 0 {
 		h.archiveReader = readers[0]
 	}
@@ -81,6 +78,12 @@ func (h *PublicHandler) Media(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
+	// Signed here so a guest scrolling the gallery fetches each photo straight
+	// from storage instead of asking the API to look it up and redirect.
+	if err := h.media.SignPage(c.Request.Context(), items.Data, mediaLinkExpiry); err != nil {
+		apierror.Respond(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": items.Data, "page": gin.H{"next_cursor": items.NextCursor, "has_more": items.HasMore}})
 }
 
@@ -100,17 +103,8 @@ func (h *PublicHandler) MediaContent(c *gin.Context) {
 	}
 	url, err := h.media.ReadURL(c.Request.Context(), evt.ID, mediaID, 5*time.Minute)
 	if err != nil {
-		if h.archiveReader != nil {
-			if location, locationErr := h.media.ArchivedLocation(c.Request.Context(), evt.ID, mediaID); locationErr == nil && location != "" {
-				body, readErr := h.archiveReader.OpenRead(c.Request.Context(), location)
-				if readErr == nil {
-					defer body.Close()
-					c.Header("Cache-Control", "private, no-store")
-					c.Status(http.StatusOK)
-					_, _ = io.Copy(c.Writer, body)
-					return
-				}
-			}
+		if serveArchivedOriginal(c, h.archiveReader, h.media, evt.ID, mediaID) {
+			return
 		}
 		if errors.Is(err, media.ErrNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "media not found"))
@@ -128,7 +122,20 @@ func (h *PublicHandler) CreateSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	_, token, err := h.guests.Create(c.Request.Context(), evt.ID)
+	var source *string
+	if h.insights != nil {
+		validatedSource, sourceErr := h.insights.ValidateSource(c.Request.Context(), evt.ID, c.Query("source"))
+		if sourceErr != nil {
+			if errors.Is(sourceErr, insights.ErrNotFound) {
+				apierror.Respond(c, apierror.New(http.StatusNotFound, "source_not_found", "QR source not found"))
+			} else {
+				apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_source", sourceErr.Error()))
+			}
+			return
+		}
+		source = validatedSource
+	}
+	_, token, err := h.guests.Create(c.Request.Context(), evt.ID, source)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
