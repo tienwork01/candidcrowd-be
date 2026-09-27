@@ -13,6 +13,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +31,10 @@ type Storage interface {
 	PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error)
 	Head(ctx context.Context, key string) (ObjectInfo, error)
 	Delete(ctx context.Context, key string) error
+	// DeleteMany removes several objects and returns the keys it could not
+	// remove. An empty result means every key is gone. Providers bill and rate
+	// limit per request, so cleanup batches one call instead of one per object.
+	DeleteMany(ctx context.Context, keys []string) ([]string, error)
 	OpenRead(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error)
 	Put(ctx context.Context, key, mime string, body io.Reader) error
 }
@@ -197,6 +202,62 @@ func (s *Service) Complete(ctx context.Context, scope UploadScope, mediaID uuid.
 	return nil
 }
 
+// MaxCompleteBatch bounds one batch confirmation. It is generous enough for a
+// guest emptying a camera roll and small enough that one request cannot hold a
+// large share of the database pool.
+const MaxCompleteBatch = 50
+
+// completeConcurrency is how many confirmations run at once. Each one holds a
+// database connection while it verifies the object with the storage provider,
+// so this trades latency against the pool the rest of the event shares.
+const completeConcurrency = 6
+
+// CompleteResult reports one media item's outcome. A batch is not all or
+// nothing: a guest with thirty good photos and one that failed to upload must
+// keep the thirty and retry only the one.
+type CompleteResult struct {
+	MediaID uuid.UUID `json:"media_id"`
+	Status  string    `json:"status"`
+	Error   string    `json:"error,omitempty"`
+}
+
+// CompleteMany confirms several uploads in one call.
+//
+// Confirming is a network round trip to storage to verify the object, plus a
+// transaction. Done one request at a time, a guest sharing forty photos on
+// venue wifi pays forty sequential round trips; here they overlap.
+//
+// It returns one result per requested id, in the order given.
+func (s *Service) CompleteMany(ctx context.Context, scope UploadScope, ids []uuid.UUID) ([]CompleteResult, error) {
+	ids = uniqueMediaIDs(ids)
+	if len(ids) == 0 || len(ids) > MaxCompleteBatch {
+		return nil, fmt.Errorf("between 1 and %d media ids are required", MaxCompleteBatch)
+	}
+	if !scope.Accepting {
+		return nil, fmt.Errorf("event is not accepting uploads")
+	}
+
+	results := make([]CompleteResult, len(ids))
+	slots := make(chan struct{}, completeConcurrency)
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func(i int, id uuid.UUID) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+
+			results[i] = CompleteResult{MediaID: id, Status: "ready"}
+			if err := s.Complete(ctx, scope, id); err != nil {
+				results[i].Status = "failed"
+				results[i].Error = err.Error()
+			}
+		}(i, id)
+	}
+	wg.Wait()
+	return results, nil
+}
+
 func thumbnailKey(m Media) string {
 	return fmt.Sprintf("events/%s/media/%s/thumbnail.jpg", m.EventID, m.ID)
 }
@@ -292,30 +353,43 @@ func (s *Service) GenerateThumbnail(ctx context.Context, mediaID uuid.UUID) erro
 // orders by last_activity_at, so a record that fails every time would
 // otherwise sit at the head of the batch and block every later run, and the
 // quota those reservations hold would never come back.
+//
+// Objects are removed in one provider call and the rows in one statement, so
+// a batch of a hundred costs two round trips rather than two hundred.
 func (s *Service) ExpireStale(ctx context.Context, before time.Time, limit int) error {
 	items, err := s.repo.FindStale(ctx, before, limit)
 	if err != nil {
 		return err
 	}
-	var failures int
-	var firstErr error
+	if len(items) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(items))
 	for _, item := range items {
-		if err := s.storage.Delete(ctx, item.ObjectKey); err != nil {
-			failures++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("delete object %s: %w", item.ObjectKey, err)
-			}
-			continue
-		}
-		if err := s.repo.Delete(ctx, item.ID); err != nil {
-			failures++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("delete media %s: %w", item.ID, err)
-			}
+		keys = append(keys, item.ObjectKey)
+	}
+	unremoved, deleteErr := s.storage.DeleteMany(ctx, keys)
+
+	// Only rows whose object is actually gone are removed. Anything left
+	// behind keeps its reservation and is retried by the next run, which is
+	// why a partial failure is safe rather than a leak.
+	stuck := make(map[string]struct{}, len(unremoved))
+	for _, key := range unremoved {
+		stuck[key] = struct{}{}
+	}
+	expired := make([]uuid.UUID, 0, len(items))
+	for _, item := range items {
+		if _, blocked := stuck[item.ObjectKey]; !blocked {
+			expired = append(expired, item.ID)
 		}
 	}
-	if failures > 0 {
-		return fmt.Errorf("expired %d of %d stale uploads: %w", len(items)-failures, len(items), firstErr)
+
+	if err := s.repo.DeleteManyUploads(ctx, expired); err != nil {
+		return fmt.Errorf("expire %d stale uploads: %w", len(expired), err)
+	}
+	if len(unremoved) > 0 {
+		return fmt.Errorf("expired %d of %d stale uploads: %w", len(expired), len(items), deleteErr)
 	}
 	return nil
 }

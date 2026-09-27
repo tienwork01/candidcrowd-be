@@ -23,11 +23,17 @@ type Cursor struct {
 
 // Repository is the persistence port for media use cases. Implementations own
 // transaction and locking details; the media service remains database-agnostic.
+//
+// Implementations must be safe for concurrent use: CompleteMany confirms a
+// batch of uploads in parallel.
 type Repository interface {
 	ReserveUpload(ctx context.Context, record Media, maxEventBytes int64) error
 	FindByClientUpload(ctx context.Context, eventID, sessionID, clientUploadID uuid.UUID) (Media, error)
 	HasReadyChecksum(ctx context.Context, eventID uuid.UUID, checksumSHA256 string) (bool, error)
 	Delete(ctx context.Context, mediaID uuid.UUID) error
+	// DeleteManyUploads removes several never-completed upload records and
+	// releases the quota they reserved, in one statement.
+	DeleteManyUploads(ctx context.Context, mediaIDs []uuid.UUID) error
 	UpdateStatus(ctx context.Context, eventID, mediaID uuid.UUID, status Status) (Media, error)
 	UpdateStatuses(ctx context.Context, eventID uuid.UUID, mediaIDs []uuid.UUID, status Status) error
 	DeleteForEvent(ctx context.Context, eventID, mediaID uuid.UUID) error

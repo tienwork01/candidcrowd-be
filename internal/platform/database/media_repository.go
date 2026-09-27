@@ -96,16 +96,33 @@ func (r *MediaRepository) HasReadyChecksum(ctx context.Context, eventID uuid.UUI
 // A record that already counted towards used_media_bytes releases nothing
 // here; moderation deletion owns that column.
 func (r *MediaRepository) Delete(ctx context.Context, mediaID uuid.UUID) error {
+	return r.DeleteManyUploads(ctx, []uuid.UUID{mediaID})
+}
+
+// DeleteManyUploads removes never-completed upload records and gives their
+// reserved bytes back, in one statement.
+//
+// The releases are summed per event before the update, so several abandoned
+// uploads belonging to the same event are subtracted once rather than the
+// event row being visited repeatedly.
+func (r *MediaRepository) DeleteManyUploads(ctx context.Context, mediaIDs []uuid.UUID) error {
+	if len(mediaIDs) == 0 {
+		return nil
+	}
 	return r.db.WithContext(ctx).Exec(`
 		WITH removed AS (
-			DELETE FROM media WHERE id = ?
+			DELETE FROM media WHERE id IN ?
 			RETURNING event_id, expected_size, status
+		), released AS (
+			SELECT event_id, SUM(expected_size) AS bytes
+			FROM removed
+			WHERE status IN ('pending', 'uploading', 'uploaded')
+			GROUP BY event_id
 		)
 		UPDATE events e
-		SET reserved_media_bytes = GREATEST(e.reserved_media_bytes - removed.expected_size, 0)
-		FROM removed
-		WHERE e.id = removed.event_id
-		  AND removed.status IN ('pending', 'uploading', 'uploaded')`, mediaID).Error
+		SET reserved_media_bytes = GREATEST(e.reserved_media_bytes - released.bytes, 0)
+		FROM released
+		WHERE e.id = released.event_id`, mediaIDs).Error
 }
 
 func (r *MediaRepository) UpdateStatus(ctx context.Context, eventID, mediaID uuid.UUID, status media.Status) (media.Media, error) {

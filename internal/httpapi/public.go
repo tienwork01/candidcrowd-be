@@ -196,6 +196,67 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 	c.JSON(http.StatusCreated, target)
 }
 
+type completeBatchRequest struct {
+	GuestSessionToken string   `json:"guest_session_token" binding:"required"`
+	MediaIDs          []string `json:"media_ids" binding:"required,min=1,max=50"`
+}
+
+// CompleteBatch confirms several uploads in one request.
+//
+// The per-item endpoint remains, and a client is free to keep using it. This
+// one exists because venue wifi is the product's hardest constraint: a guest
+// sharing a camera roll otherwise pays one sequential round trip per photo,
+// each carrying a verification call to storage.
+//
+// It answers 200 with a per-item outcome rather than failing the batch, so a
+// guest keeps the photos that landed and retries only the ones that did not.
+func (h *PublicHandler) CompleteBatch(c *gin.Context) {
+	var req completeBatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", err.Error()))
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(req.MediaIDs))
+	for _, raw := range req.MediaIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "media ids must be UUIDs"))
+			return
+		}
+		ids = append(ids, id)
+	}
+	evt, ok := h.publicEvent(c)
+	if !ok {
+		return
+	}
+	session, err := h.guests.Validate(c.Request.Context(), evt.ID, req.GuestSessionToken)
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusUnauthorized, "invalid_guest_session", "guest session is invalid or expired"))
+		return
+	}
+	results, err := h.media.CompleteMany(c.Request.Context(), media.UploadScope{
+		EventID:        evt.ID,
+		GuestSessionID: session.ID,
+		Accepting:      evt.Status == event.StatusActive,
+		MaxEventBytes:  evt.MaxMediaBytes,
+	}, ids)
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_not_allowed", err.Error()))
+		return
+	}
+	var ready int
+	for _, result := range results {
+		if result.Status == "ready" {
+			ready++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"results":      results,
+		"ready_count":  ready,
+		"failed_count": len(results) - ready,
+	})
+}
+
 type completeRequest struct {
 	GuestSessionToken string `json:"guest_session_token" binding:"required"`
 }

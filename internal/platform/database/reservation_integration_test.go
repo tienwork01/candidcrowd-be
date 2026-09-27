@@ -251,3 +251,51 @@ func TestArchivingMarksMediaSoTheGalleryStopsSigningIt(t *testing.T) {
 	require.Len(t, listed, 1)
 	require.True(t, listed[0].SourceArchived())
 }
+
+// Cleanup removes abandoned uploads in one statement. The releases are summed
+// per event first, so several abandoned uploads on the same event subtract
+// once rather than visiting the event row repeatedly.
+func TestDeleteManyUploadsReleasesQuotaPerEvent(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewMediaRepository(db)
+	ctx := context.Background()
+	firstEvent, firstSession := seedEvent(t, db, 10_000)
+	secondEvent, secondSession := seedEvent(t, db, 10_000)
+
+	var abandoned []uuid.UUID
+	for i := 0; i < 3; i++ {
+		record := pendingRecord(firstEvent, firstSession, 100)
+		require.NoError(t, repo.ReserveUpload(ctx, record, 0))
+		abandoned = append(abandoned, record.ID)
+	}
+	other := pendingRecord(secondEvent, secondSession, 250)
+	require.NoError(t, repo.ReserveUpload(ctx, other, 0))
+	abandoned = append(abandoned, other.ID)
+
+	// One that completed must not have its bytes released by the cleanup.
+	kept := pendingRecord(firstEvent, firstSession, 100)
+	require.NoError(t, repo.ReserveUpload(ctx, kept, 0))
+	require.NoError(t, repo.MarkReady(ctx, firstEvent, kept.ID, 90, time.Now().UTC()))
+
+	counter, truth := reservedCounter(t, db, firstEvent)
+	require.EqualValues(t, 300, counter)
+	require.Equal(t, truth, counter)
+
+	require.NoError(t, repo.DeleteManyUploads(ctx, abandoned))
+
+	counter, truth = reservedCounter(t, db, firstEvent)
+	require.Zero(t, counter, "three abandoned uploads on one event release exactly their bytes")
+	require.Equal(t, truth, counter)
+
+	counter, truth = reservedCounter(t, db, secondEvent)
+	require.Zero(t, counter, "the batch spanned two events and settled both")
+	require.Equal(t, truth, counter)
+
+	// The completed upload is untouched: its bytes live in used, not reserved.
+	var evt event.Event
+	require.NoError(t, db.First(&evt, "id = ?", firstEvent).Error)
+	require.EqualValues(t, 90, evt.UsedMediaBytes)
+
+	// An empty batch is a no-op rather than an error.
+	require.NoError(t, repo.DeleteManyUploads(ctx, nil))
+}

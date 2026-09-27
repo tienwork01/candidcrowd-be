@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -45,6 +46,9 @@ func TestUploadValidation(t *testing.T) {
 }
 
 type memoryRepository struct {
+	// CompleteMany confirms a batch in parallel, so the fake has to honour the
+	// same concurrency contract the Postgres repository does.
+	mu      sync.Mutex
 	records map[uuid.UUID]Media
 	ready   map[uuid.UUID]bool
 	// gallery is the ordered page source for ListGallery. It stays nil unless
@@ -59,10 +63,14 @@ func newMemoryRepository() *memoryRepository {
 }
 
 func (r *memoryRepository) ReserveUpload(_ context.Context, record Media, _ int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.records[record.ID] = record
 	return nil
 }
 func (r *memoryRepository) FindByClientUpload(_ context.Context, eventID, sessionID, clientUploadID uuid.UUID) (Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, record := range r.records {
 		if record.EventID == eventID && record.GuestSessionID == sessionID && record.ClientUploadID != nil && *record.ClientUploadID == clientUploadID {
 			return record, nil
@@ -71,6 +79,8 @@ func (r *memoryRepository) FindByClientUpload(_ context.Context, eventID, sessio
 	return Media{}, ErrNotFound
 }
 func (r *memoryRepository) HasReadyChecksum(_ context.Context, eventID uuid.UUID, checksumSHA256 string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for id, record := range r.records {
 		if r.ready[id] && record.EventID == eventID && record.ChecksumSHA256 == checksumSHA256 {
 			return true, nil
@@ -79,10 +89,14 @@ func (r *memoryRepository) HasReadyChecksum(_ context.Context, eventID uuid.UUID
 	return false, nil
 }
 func (r *memoryRepository) Delete(_ context.Context, id uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	delete(r.records, id)
 	return nil
 }
 func (r *memoryRepository) UpdateStatus(_ context.Context, eventID, id uuid.UUID, status Status) (Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID || !validModerationStatus(status) {
 		return Media{}, ErrNotFound
@@ -100,6 +114,8 @@ func (r *memoryRepository) UpdateStatuses(ctx context.Context, eventID uuid.UUID
 	return nil
 }
 func (r *memoryRepository) DeleteForEvent(_ context.Context, eventID, id uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID {
 		return ErrNotFound
@@ -117,6 +133,8 @@ func (r *memoryRepository) DeleteManyForEvent(ctx context.Context, eventID uuid.
 	return nil
 }
 func (r *memoryRepository) FindUploadForSession(_ context.Context, id, eventID, sessionID uuid.UUID) (Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID || record.GuestSessionID != sessionID {
 		return Media{}, ErrNotFound
@@ -124,6 +142,8 @@ func (r *memoryRepository) FindUploadForSession(_ context.Context, id, eventID, 
 	return record, nil
 }
 func (r *memoryRepository) MarkReady(_ context.Context, eventID, id uuid.UUID, actualSize int64, uploadedAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID {
 		return ErrNotFound
@@ -133,6 +153,8 @@ func (r *memoryRepository) MarkReady(_ context.Context, eventID, id uuid.UUID, a
 	return nil
 }
 func (r *memoryRepository) MarkThumbnailReady(_ context.Context, eventID, id uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID {
 		return ErrNotFound
@@ -142,9 +164,13 @@ func (r *memoryRepository) MarkThumbnailReady(_ context.Context, eventID, id uui
 	return nil
 }
 func (r *memoryRepository) ListReady(_ context.Context, _ uuid.UUID, _ int, _ *Cursor) ([]Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return nil, nil
 }
 func (r *memoryRepository) ListGallery(_ context.Context, _ uuid.UUID, _ GalleryFilter, _ GallerySort, limit int, before *Cursor) ([]Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	items := make([]Media, 0, len(r.gallery))
 	for _, record := range r.gallery {
 		if before != nil && !record.CreatedAt.Before(before.CreatedAt) {
@@ -158,17 +184,31 @@ func (r *memoryRepository) ListGallery(_ context.Context, _ uuid.UUID, _ Gallery
 	return items, nil
 }
 func (r *memoryRepository) GalleryCounts(_ context.Context, _ uuid.UUID) (GalleryCounts, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.countCalls++
 	return GalleryCounts{All: int64(len(r.gallery))}, nil
 }
 func (r *memoryRepository) FindReady(_ context.Context, eventID, id uuid.UUID) (Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID || !r.ready[id] {
 		return Media{}, ErrNotFound
 	}
 	return record, nil
 }
+func (r *memoryRepository) DeleteManyUploads(_ context.Context, ids []uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		delete(r.records, id)
+	}
+	return nil
+}
 func (r *memoryRepository) FindByID(_ context.Context, id uuid.UUID) (Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok {
 		return Media{}, ErrNotFound
@@ -176,9 +216,13 @@ func (r *memoryRepository) FindByID(_ context.Context, id uuid.UUID) (Media, err
 	return record, nil
 }
 func (r *memoryRepository) FindArchivedLocation(context.Context, uuid.UUID, uuid.UUID) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return "", ErrNotFound
 }
 func (r *memoryRepository) FindStale(_ context.Context, before time.Time, _ int) ([]Media, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	items := make([]Media, 0)
 	for _, record := range r.records {
 		if record.Status != StatusReady && record.LastActivityAt.Before(before) {
@@ -198,6 +242,9 @@ func (s memoryStorage) PresignGet(context.Context, string, time.Duration) (strin
 }
 func (s memoryStorage) Head(context.Context, string) (ObjectInfo, error) { return s.head, nil }
 func (s memoryStorage) Delete(context.Context, string) error             { return nil }
+func (s memoryStorage) DeleteMany(context.Context, []string) ([]string, error) {
+	return nil, nil
+}
 func (s memoryStorage) OpenRead(context.Context, string) (io.ReadCloser, ObjectInfo, error) {
 	return io.NopCloser(bytes.NewReader(nil)), s.head, nil
 }
@@ -424,6 +471,9 @@ func (s *thumbnailStorage) Head(context.Context, string) (ObjectInfo, error) {
 	return ObjectInfo{Size: int64(len(s.object)), ContentType: "image/png"}, nil
 }
 func (s *thumbnailStorage) Delete(context.Context, string) error { return nil }
+func (s *thumbnailStorage) DeleteMany(context.Context, []string) ([]string, error) {
+	return nil, nil
+}
 func (s *thumbnailStorage) OpenRead(context.Context, string) (io.ReadCloser, ObjectInfo, error) {
 	if s.readErr != nil {
 		return nil, ObjectInfo{}, s.readErr
@@ -609,25 +659,39 @@ func TestSignPageKeepsTheApplicationRouteForArchivedOriginals(t *testing.T) {
 	require.Equal(t, 1, storage.presigns)
 }
 
-// failingDeleteStorage fails for one specific key and succeeds for the rest.
+// failingDeleteStorage removes every key of a batch except one, the way a
+// provider reports per-object errors inside an otherwise successful request.
 type failingDeleteStorage struct {
 	*thumbnailStorage
 	poison  string
 	deleted []string
+	calls   int
 }
 
-func (s *failingDeleteStorage) Delete(_ context.Context, key string) error {
-	if key == s.poison {
-		return errors.New("object is locked")
+func (s *failingDeleteStorage) DeleteMany(_ context.Context, keys []string) ([]string, error) {
+	s.calls++
+	var failed []string
+	for _, key := range keys {
+		if key == s.poison {
+			failed = append(failed, key)
+			continue
+		}
+		s.deleted = append(s.deleted, key)
 	}
-	s.deleted = append(s.deleted, key)
-	return nil
+	if len(failed) > 0 {
+		return failed, errors.New("object is locked")
+	}
+	return nil, nil
 }
 
 // A single stubborn record used to block the whole cleanup on every run,
 // because FindStale returns the oldest first and the loop stopped on it. The
 // quota those reservations held was never released.
-func TestExpireStaleContinuesPastAFailingItem(t *testing.T) {
+//
+// The record that could not be removed keeps its row on purpose: deleting it
+// while its object survives would strand the object and lose the only handle
+// on it.
+func TestExpireStaleRemovesEveryItemItCan(t *testing.T) {
 	repo := newMemoryRepository()
 	eventID := uuid.New()
 	old := time.Now().UTC().Add(-48 * time.Hour)
@@ -644,5 +708,167 @@ func TestExpireStaleContinuesPastAFailingItem(t *testing.T) {
 
 	require.Equal(t, []string{"fine"}, storage.deleted)
 	require.NotContains(t, repo.records, good, "the healthy record must still be expired")
-	require.Contains(t, repo.records, poison)
+	require.Contains(t, repo.records, poison, "a row whose object survives must be retried, not dropped")
+}
+
+// The whole point of batching: a hundred abandoned uploads must not cost a
+// hundred provider round trips.
+func TestExpireStaleDeletesObjectsInOneCall(t *testing.T) {
+	repo := newMemoryRepository()
+	eventID := uuid.New()
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	for i := 0; i < 100; i++ {
+		id := uuid.New()
+		repo.records[id] = Media{ID: id, EventID: eventID, ObjectKey: fmt.Sprintf("k%d", i), Status: StatusPending, LastActivityAt: old}
+	}
+	storage := &failingDeleteStorage{thumbnailStorage: newThumbnailStorage(nil)}
+	service := galleryService(repo, storage)
+
+	require.NoError(t, service.ExpireStale(context.Background(), time.Now().UTC(), 200))
+	require.Equal(t, 1, storage.calls, "one hundred objects, one provider request")
+	require.Len(t, storage.deleted, 100)
+	require.Empty(t, repo.records)
+}
+
+// slowHeadStorage measures how much of a batch overlapped.
+type slowHeadStorage struct {
+	memoryStorage
+	mu      sync.Mutex
+	inFlate int
+	peak    int
+	delay   time.Duration
+	failFor map[string]bool
+}
+
+func (s *slowHeadStorage) Head(_ context.Context, key string) (ObjectInfo, error) {
+	s.mu.Lock()
+	s.inFlate++
+	if s.inFlate > s.peak {
+		s.peak = s.inFlate
+	}
+	s.mu.Unlock()
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.inFlate--
+	shouldFail := s.failFor[key]
+	s.mu.Unlock()
+
+	if shouldFail {
+		return ObjectInfo{}, errors.New("object not found")
+	}
+	return s.memoryStorage.head, nil
+}
+
+// reserveUploads creates n pending records and returns their ids.
+func reserveUploads(t *testing.T, service *Service, scope UploadScope, n int) []uuid.UUID {
+	t.Helper()
+	ids := make([]uuid.UUID, 0, n)
+	for i := 0; i < n; i++ {
+		target, err := service.CreateUpload(context.Background(), scope, CreateInput{
+			Filename: fmt.Sprintf("guest%d.jpg", i), MIMEType: "image/jpeg", Size: 42,
+			ChecksumSHA256: fmt.Sprintf("%064x", i+1), ClientUploadID: uuid.New(),
+		})
+		require.NoError(t, err)
+		ids = append(ids, target.MediaID)
+	}
+	return ids
+}
+
+// Confirming one photo at a time costs a guest one sequential round trip per
+// photo on venue wifi, which is the product's hardest constraint.
+func TestCompleteManyConfirmsUploadsConcurrently(t *testing.T) {
+	repo := newMemoryRepository()
+	storage := &slowHeadStorage{
+		memoryStorage: memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}},
+		delay:         20 * time.Millisecond,
+		failFor:       map[string]bool{},
+	}
+	service := NewService(repo, storage, allowAllLimiter{}, time.Minute, time.Minute, 100, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 100_000}
+	ids := reserveUploads(t, service, scope, 12)
+
+	started := time.Now()
+	results, err := service.CompleteMany(context.Background(), scope, ids)
+	elapsed := time.Since(started)
+
+	require.NoError(t, err)
+	require.Len(t, results, 12)
+	for _, result := range results {
+		require.Equal(t, "ready", result.Status, result.Error)
+	}
+	require.Greater(t, storage.peak, 1, "the batch must overlap rather than run one at a time")
+	require.LessOrEqual(t, storage.peak, completeConcurrency, "the pool ceiling must hold")
+	// Sequential would be 12 x 20ms; overlapping cuts it to a few waves.
+	require.Less(t, elapsed, 200*time.Millisecond)
+}
+
+// A guest with thirty good photos and one bad upload must keep the thirty.
+func TestCompleteManyReportsEachItemSeparately(t *testing.T) {
+	repo := newMemoryRepository()
+	storage := &slowHeadStorage{
+		memoryStorage: memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}},
+		failFor:       map[string]bool{},
+	}
+	service := NewService(repo, storage, allowAllLimiter{}, time.Minute, time.Minute, 100, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 100_000}
+	ids := reserveUploads(t, service, scope, 4)
+
+	// The second photo never finished uploading to storage.
+	broken, err := repo.FindByID(context.Background(), ids[1])
+	require.NoError(t, err)
+	storage.failFor[broken.ObjectKey] = true
+
+	results, err := service.CompleteMany(context.Background(), scope, ids)
+	require.NoError(t, err)
+	require.Len(t, results, 4)
+
+	// Results come back in the order asked for, so a client can match them up.
+	for i, result := range results {
+		require.Equal(t, ids[i], result.MediaID)
+	}
+	require.Equal(t, "failed", results[1].Status)
+	require.NotEmpty(t, results[1].Error)
+	for _, i := range []int{0, 2, 3} {
+		require.Equal(t, "ready", results[i].Status, results[i].Error)
+		record, findErr := repo.FindReady(context.Background(), scope.EventID, ids[i])
+		require.NoError(t, findErr)
+		require.Equal(t, StatusReady, record.Status)
+	}
+}
+
+func TestCompleteManyRejectsUnusableBatches(t *testing.T) {
+	repo := newMemoryRepository()
+	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}},
+		allowAllLimiter{}, time.Minute, time.Minute, 100, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 100_000}
+
+	_, err := service.CompleteMany(context.Background(), scope, nil)
+	require.Error(t, err, "an empty batch is a client mistake, not a no-op")
+
+	oversized := make([]uuid.UUID, MaxCompleteBatch+1)
+	for i := range oversized {
+		oversized[i] = uuid.New()
+	}
+	_, err = service.CompleteMany(context.Background(), scope, oversized)
+	require.Error(t, err)
+
+	closed := scope
+	closed.Accepting = false
+	_, err = service.CompleteMany(context.Background(), closed, []uuid.UUID{uuid.New()})
+	require.Error(t, err, "a closed event must not accept confirmations")
+}
+
+// Duplicate ids in one batch must be confirmed once, not raced against
+// themselves.
+func TestCompleteManyDeduplicatesIDs(t *testing.T) {
+	repo := newMemoryRepository()
+	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}},
+		allowAllLimiter{}, time.Minute, time.Minute, 100, 100, 100)
+	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 100_000}
+	ids := reserveUploads(t, service, scope, 1)
+
+	results, err := service.CompleteMany(context.Background(), scope, []uuid.UUID{ids[0], ids[0], ids[0]})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, "ready", results[0].Status)
 }

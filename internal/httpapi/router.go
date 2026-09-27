@@ -94,6 +94,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	pub.POST("/sessions", cfg.Public.CreateSession)
 	pub.POST("/uploads", cfg.Public.CreateUpload)
 	pub.POST("/uploads/:uploadId/complete", cfg.Public.Complete)
+	// Batch confirmation. The per-item route above is kept so existing clients
+	// keep working; this one spares a guest one round trip per photo.
+	pub.POST("/uploads/complete", cfg.Public.CompleteBatch)
 	r.GET("/api/v1/public/live-wall-sessions/:token", cfg.LiveWall.Player)
 	r.GET("/api/v1/public/live-wall-sessions/:token/stream", cfg.LiveWall.Stream)
 	r.GET("/api/v1/public/live-wall-sessions/:token/media/:mediaId/content", cfg.LiveWall.Content)

@@ -10,6 +10,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
 )
 
@@ -67,6 +68,53 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectInfo, error) {
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	return err
+}
+
+// maxDeleteBatch is the ceiling the S3 DeleteObjects API imposes per request.
+const maxDeleteBatch = 1000
+
+// DeleteMany removes objects in batches and returns the keys that survived.
+//
+// A whole batch failing is reported by returning every key in it: the caller
+// decides what to do, and its only correct move either way is to leave those
+// database rows alone so the next run tries again.
+func (c *Client) DeleteMany(ctx context.Context, keys []string) ([]string, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	var failed []string
+	var firstErr error
+	for start := 0; start < len(keys); start += maxDeleteBatch {
+		end := start + maxDeleteBatch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[start:end]
+
+		objects := make([]types.ObjectIdentifier, 0, len(chunk))
+		for _, key := range chunk {
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		out, err := c.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(c.bucket),
+			// Quiet asks the provider to report only the failures.
+			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			failed = append(failed, chunk...)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, deleteErr := range out.Errors {
+			failed = append(failed, aws.ToString(deleteErr.Key))
+			if firstErr == nil {
+				firstErr = fmt.Errorf("delete %s: %s", aws.ToString(deleteErr.Key), aws.ToString(deleteErr.Message))
+			}
+		}
+	}
+	return failed, firstErr
 }
 
 func (c *Client) Put(ctx context.Context, key, mime string, body io.Reader) error {
