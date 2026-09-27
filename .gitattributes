@@ -1,0 +1,29 @@
+# Line endings are normalised to LF everywhere.
+#
+# This repository was worked on with core.autocrlf=true and no attributes
+# file, which checked most files out as CRLF while any tool that rewrote a
+# file wrote LF back. The tree ended up with both conventions: gofmt reported
+# correctly formatted files as unformatted, and an edit to a CRLF file could
+# produce a diff made entirely of CR bytes.
+#
+# eol=lf takes precedence over core.autocrlf, so every checkout gets LF on
+# every platform regardless of how each developer has git configured.
+* text=auto eol=lf
+
+# Declared binary so content detection can never mangle them. This is a media
+# product, so fixtures in these formats are likely to appear.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.webp binary
+*.heic binary
+*.gif  binary
+*.mp4  binary
+*.mov  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.exe  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
