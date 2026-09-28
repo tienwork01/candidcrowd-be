@@ -69,7 +69,7 @@ func (h *LiveWallHandler) Create(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusCreated, gin.H{"id": session.ID, "token": token, "expires_at": session.ExpiresAt, "status": session.Status, "show_cta": session.ShowCTA, "content_policy": session.ContentPolicy, "cta_every_media": session.CTAEveryMedia})
+	c.JSON(http.StatusCreated, gin.H{"id": session.ID, "token": token, "expires_at": session.ExpiresAt, "status": session.Status, "show_cta": session.ShowCTA, "content_policy": session.ContentPolicy, "cta_every_media": session.CTAEveryMedia, "layout_mode": session.LayoutMode, "slide_duration_seconds": session.SlideDuration, "qr_strategy": session.QRStrategy, "arrival_behavior": session.ArrivalBehavior, "revision": session.Revision})
 }
 
 func (h *LiveWallHandler) Get(c *gin.Context) {
@@ -108,8 +108,13 @@ func (h *LiveWallHandler) End(c *gin.Context) {
 }
 
 type liveWallUpdateRequest struct {
-	ContentPolicy *livewall.ContentPolicy `json:"content_policy"`
-	CTAEveryMedia *int                    `json:"cta_every_media"`
+	ContentPolicy    *livewall.ContentPolicy   `json:"content_policy"`
+	CTAEveryMedia    *int                      `json:"cta_every_media"`
+	LayoutMode       *livewall.LayoutMode      `json:"layout_mode"`
+	SlideDuration    *int                      `json:"slide_duration_seconds"`
+	QRStrategy       *livewall.QRStrategy      `json:"qr_strategy"`
+	ArrivalBehavior  *livewall.ArrivalBehavior `json:"arrival_behavior"`
+	ExpectedRevision *int64                    `json:"expected_revision"`
 }
 
 func (h *LiveWallHandler) Update(c *gin.Context) {
@@ -123,22 +128,22 @@ func (h *LiveWallHandler) Update(c *gin.Context) {
 		return
 	}
 	var request liveWallUpdateRequest
-	if err := c.ShouldBindJSON(&request); err != nil || (request.ContentPolicy == nil && request.CTAEveryMedia == nil) || (request.ContentPolicy != nil && request.CTAEveryMedia != nil) {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_live_wall_settings", "exactly one live wall setting is required"))
+	if err := c.ShouldBindJSON(&request); err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_live_wall_settings", "invalid live wall settings"))
 		return
 	}
-	var session livewall.Session
-	if request.ContentPolicy != nil {
-		session, err = h.sessions.UpdateContentPolicy(c.Request.Context(), evt.ID, id, *request.ContentPolicy)
-	} else {
-		session, err = h.sessions.UpdateCTAEveryMedia(c.Request.Context(), evt.ID, id, *request.CTAEveryMedia)
-	}
-	if errors.Is(err, livewall.ErrInvalidContentPolicy) {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_content_policy", "invalid live wall content policy"))
+	session, err := h.sessions.UpdatePresentation(c.Request.Context(), evt.ID, id, livewall.PresentationSettings{
+		ContentPolicy: request.ContentPolicy, CTAEveryMedia: request.CTAEveryMedia,
+		LayoutMode: request.LayoutMode, SlideDuration: request.SlideDuration,
+		QRStrategy: request.QRStrategy, ArrivalBehavior: request.ArrivalBehavior,
+		ExpectedRevision: request.ExpectedRevision,
+	})
+	if errors.Is(err, livewall.ErrInvalidPresentation) {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_live_wall_settings", "invalid live wall presentation settings"))
 		return
 	}
-	if errors.Is(err, livewall.ErrInvalidCTAEveryMedia) {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_cta_cadence", "live wall CTA cadence must be between 3 and 30"))
+	if errors.Is(err, livewall.ErrRevisionConflict) {
+		apierror.Respond(c, apierror.New(http.StatusConflict, "live_wall_revision_conflict", "live wall settings were updated elsewhere; refresh and try again"))
 		return
 	}
 	if errors.Is(err, livewall.ErrNotFound) {
@@ -196,7 +201,7 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "60"))
 	filter := media.FilterAll
-	if session.ContentPolicy == livewall.ContentPolicyFeaturedOnly {
+	if session.ContentPolicy == livewall.ContentPolicyFeaturedOnly || session.LayoutMode == livewall.LayoutModeFeatured {
 		filter = media.FilterFavorites
 	}
 	items, err := h.media.ListGallery(c.Request.Context(), session.EventID, filter, media.SortNewest, limit, c.Query("cursor"), func(id uuid.UUID) string {
@@ -224,12 +229,16 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 		"event":   eventPayload,
 		"session": gin.H{"id": session.ID, "expires_at": session.ExpiresAt, "content_policy": session.ContentPolicy},
 		"presentation": gin.H{
-			"is_playing":      session.IsPlaying,
-			"show_cta":        session.ShowCTA,
-			"is_blackout":     session.IsBlackout,
-			"cta_every_media": session.CTAEveryMedia,
-			"revision":        session.Revision,
-			"content_policy":  session.ContentPolicy,
+			"is_playing":             session.IsPlaying,
+			"show_cta":               session.ShowCTA,
+			"is_blackout":            session.IsBlackout,
+			"cta_every_media":        session.CTAEveryMedia,
+			"revision":               session.Revision,
+			"content_policy":         session.ContentPolicy,
+			"layout_mode":            session.LayoutMode,
+			"slide_duration_seconds": session.SlideDuration,
+			"qr_strategy":            session.QRStrategy,
+			"arrival_behavior":       session.ArrivalBehavior,
 		},
 		"data": items.Data,
 		"page": gin.H{"next_cursor": items.NextCursor, "has_more": items.HasMore},

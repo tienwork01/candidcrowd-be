@@ -56,15 +56,19 @@ func (n *Notifier) EventChanged(ctx context.Context, change event.Change) {
 func (n *Notifier) LiveWallChanged(ctx context.Context, change livewall.Change) {
 	session := change.Session
 	msg, err := NewMessage(session.EventID, KindLiveWallPresentation, AudiencePublic, map[string]any{
-		"session_id":      session.ID,
-		"status":          session.Status,
-		"is_playing":      session.IsPlaying,
-		"show_cta":        session.ShowCTA,
-		"is_blackout":     session.IsBlackout,
-		"cta_every_media": session.CTAEveryMedia,
-		"revision":        session.Revision,
-		"command":         change.Command,
-		"content_policy":  session.ContentPolicy,
+		"session_id":             session.ID,
+		"status":                 session.Status,
+		"is_playing":             session.IsPlaying,
+		"show_cta":               session.ShowCTA,
+		"is_blackout":            session.IsBlackout,
+		"cta_every_media":        session.CTAEveryMedia,
+		"revision":               session.Revision,
+		"command":                change.Command,
+		"content_policy":         session.ContentPolicy,
+		"layout_mode":            session.LayoutMode,
+		"slide_duration_seconds": session.SlideDuration,
+		"qr_strategy":            session.QRStrategy,
+		"arrival_behavior":       session.ArrivalBehavior,
 	})
 	if err != nil {
 		n.log.Error("realtime: could not build live wall message", "event_id", session.EventID, "error", err)

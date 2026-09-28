@@ -18,10 +18,15 @@ var (
 	ErrInvalidCommand       = errors.New("live wall: invalid command")
 	ErrInvalidContentPolicy = errors.New("live wall: invalid content policy")
 	ErrInvalidCTAEveryMedia = errors.New("live wall: invalid CTA cadence")
+	ErrInvalidPresentation  = errors.New("live wall: invalid presentation settings")
+	ErrRevisionConflict     = errors.New("live wall: presentation revision conflict")
 )
 
 type Status string
 type ContentPolicy string
+type LayoutMode string
+type QRStrategy string
+type ArrivalBehavior string
 
 const (
 	StatusLive    Status = "live"
@@ -35,27 +40,48 @@ const (
 )
 
 const (
+	LayoutModeSpotlight LayoutMode = "spotlight"
+	LayoutModeMosaic    LayoutMode = "mosaic"
+	LayoutModeFeatured  LayoutMode = "featured"
+
+	QRStrategyInterval  QRStrategy = "interval"
+	QRStrategyAlways    QRStrategy = "always"
+	QRStrategyEmptyOnly QRStrategy = "empty_only"
+	QRStrategyHidden    QRStrategy = "hidden"
+
+	ArrivalBehaviorQueue ArrivalBehavior = "queue"
+	ArrivalBehaviorNext  ArrivalBehavior = "next"
+)
+
+const (
 	DefaultCTAEveryMedia = 8
 	MinCTAEveryMedia     = 3
 	MaxCTAEveryMedia     = 30
+	DefaultSlideDuration = 5
+	MinSlideDuration     = 5
+	MaxSlideDuration     = 12
 )
 
 type Session struct {
-	ID            uuid.UUID     `gorm:"type:uuid;primaryKey" json:"id"`
-	EventID       uuid.UUID     `gorm:"type:uuid;not null;index" json:"event_id"`
-	EventName     string        `gorm:"not null" json:"event_name"`
-	EventSlug     string        `gorm:"not null" json:"event_slug"`
-	TokenHash     string        `gorm:"not null;uniqueIndex" json:"-"`
-	Status        Status        `gorm:"not null" json:"status"`
-	ContentPolicy ContentPolicy `gorm:"not null;default:auto_approved" json:"content_policy"`
-	IsPlaying     bool          `gorm:"not null;default:true" json:"is_playing"`
-	ShowCTA       bool          `gorm:"not null;default:false" json:"show_cta"`
-	IsBlackout    bool          `gorm:"not null;default:false" json:"is_blackout"`
-	CTAEveryMedia int           `gorm:"not null;default:8" json:"cta_every_media"`
-	Revision      int64         `gorm:"not null;default:0" json:"revision"`
-	ExpiresAt     time.Time     `json:"expires_at"`
-	CreatedAt     time.Time     `json:"created_at"`
-	EndedAt       *time.Time    `json:"ended_at,omitempty"`
+	ID              uuid.UUID       `gorm:"type:uuid;primaryKey" json:"id"`
+	EventID         uuid.UUID       `gorm:"type:uuid;not null;index" json:"event_id"`
+	EventName       string          `gorm:"not null" json:"event_name"`
+	EventSlug       string          `gorm:"not null" json:"event_slug"`
+	TokenHash       string          `gorm:"not null;uniqueIndex" json:"-"`
+	Status          Status          `gorm:"not null" json:"status"`
+	ContentPolicy   ContentPolicy   `gorm:"not null;default:auto_approved" json:"content_policy"`
+	IsPlaying       bool            `gorm:"not null;default:true" json:"is_playing"`
+	ShowCTA         bool            `gorm:"not null;default:false" json:"show_cta"`
+	IsBlackout      bool            `gorm:"not null;default:false" json:"is_blackout"`
+	CTAEveryMedia   int             `gorm:"not null;default:8" json:"cta_every_media"`
+	LayoutMode      LayoutMode      `gorm:"not null;default:spotlight" json:"layout_mode"`
+	SlideDuration   int             `gorm:"column:slide_duration_seconds;not null;default:5" json:"slide_duration_seconds"`
+	QRStrategy      QRStrategy      `gorm:"not null;default:interval" json:"qr_strategy"`
+	ArrivalBehavior ArrivalBehavior `gorm:"not null;default:queue" json:"arrival_behavior"`
+	Revision        int64           `gorm:"not null;default:0" json:"revision"`
+	ExpiresAt       time.Time       `json:"expires_at"`
+	CreatedAt       time.Time       `json:"created_at"`
+	EndedAt         *time.Time      `json:"ended_at,omitempty"`
 }
 
 // TableName keeps GORM aligned with the explicit, domain-scoped migration
@@ -83,6 +109,19 @@ type Change struct {
 	Command Command
 }
 
+// PresentationSettings is the small, persistent contract shared by the host
+// remote and every projector. Pointer fields let a PATCH update only the
+// requested settings while validation remains in the Live Wall domain.
+type PresentationSettings struct {
+	ContentPolicy    *ContentPolicy
+	CTAEveryMedia    *int
+	LayoutMode       *LayoutMode
+	SlideDuration    *int
+	QRStrategy       *QRStrategy
+	ArrivalBehavior  *ArrivalBehavior
+	ExpectedRevision *int64
+}
+
 // Notifier is intentionally narrow so the live-wall package stays independent
 // from the transport used to notify connected players.
 type Notifier interface {
@@ -97,6 +136,7 @@ type Repository interface {
 	Command(context.Context, uuid.UUID, uuid.UUID, Command) (Session, error)
 	UpdateContentPolicy(context.Context, uuid.UUID, uuid.UUID, ContentPolicy) (Session, error)
 	UpdateCTAEveryMedia(context.Context, uuid.UUID, uuid.UUID, int) (Session, error)
+	UpdatePresentation(context.Context, uuid.UUID, uuid.UUID, PresentationSettings) (Session, error)
 }
 
 type gormRepository struct{ db *gorm.DB }
@@ -181,6 +221,45 @@ func (r *gormRepository) UpdateCTAEveryMedia(ctx context.Context, eventID, id uu
 	return r.updateLive(ctx, eventID, id, map[string]any{"cta_every_media": every, "revision": gorm.Expr("revision + 1")})
 }
 
+func (r *gormRepository) UpdatePresentation(ctx context.Context, eventID, id uuid.UUID, settings PresentationSettings) (Session, error) {
+	updates := map[string]any{"revision": gorm.Expr("revision + 1")}
+	if settings.ContentPolicy != nil {
+		updates["content_policy"] = *settings.ContentPolicy
+	}
+	if settings.CTAEveryMedia != nil {
+		updates["cta_every_media"] = *settings.CTAEveryMedia
+	}
+	if settings.LayoutMode != nil {
+		updates["layout_mode"] = *settings.LayoutMode
+	}
+	if settings.SlideDuration != nil {
+		updates["slide_duration_seconds"] = *settings.SlideDuration
+	}
+	if settings.QRStrategy != nil {
+		updates["qr_strategy"] = *settings.QRStrategy
+	}
+	if settings.ArrivalBehavior != nil {
+		updates["arrival_behavior"] = *settings.ArrivalBehavior
+	}
+	var session Session
+	db := r.db.WithContext(ctx).Model(&session).Clauses(clause.Returning{}).
+		Where("id = ? AND event_id = ? AND status = ?", id, eventID, StatusLive)
+	if settings.ExpectedRevision != nil {
+		db = db.Where("revision = ?", *settings.ExpectedRevision)
+	}
+	result := db.Updates(updates)
+	if result.Error != nil {
+		return Session{}, result.Error
+	}
+	if result.RowsAffected != 1 {
+		if settings.ExpectedRevision != nil {
+			return Session{}, ErrRevisionConflict
+		}
+		return Session{}, ErrNotFound
+	}
+	return session, nil
+}
+
 func mapNotFound(err error) error {
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return ErrNotFound
@@ -211,7 +290,7 @@ func (s *Service) Create(ctx context.Context, eventID uuid.UUID, eventName, even
 	// A fresh wall should show successfully uploaded guest media immediately.
 	// Hosts can still switch to featured_only from the live controls when they
 	// need a curated display.
-	session := Session{ID: uuid.New(), EventID: eventID, EventName: eventName, EventSlug: eventSlug, TokenHash: tokenHash(token), Status: StatusLive, ContentPolicy: ContentPolicyAutoApproved, CTAEveryMedia: DefaultCTAEveryMedia, ExpiresAt: now.Add(s.lifetime), CreatedAt: now}
+	session := Session{ID: uuid.New(), EventID: eventID, EventName: eventName, EventSlug: eventSlug, TokenHash: tokenHash(token), Status: StatusLive, ContentPolicy: ContentPolicyAutoApproved, CTAEveryMedia: DefaultCTAEveryMedia, LayoutMode: LayoutModeSpotlight, SlideDuration: DefaultSlideDuration, QRStrategy: QRStrategyInterval, ArrivalBehavior: ArrivalBehaviorQueue, ExpiresAt: now.Add(s.lifetime), CreatedAt: now}
 	created, err := s.repo.Create(ctx, session)
 	return created, token, err
 }
@@ -248,6 +327,35 @@ func (s *Service) UpdateCTAEveryMedia(ctx context.Context, eventID, id uuid.UUID
 		return Session{}, ErrInvalidCTAEveryMedia
 	}
 	session, err := s.repo.UpdateCTAEveryMedia(ctx, eventID, id, every)
+	if err == nil {
+		s.notify(ctx, session, "")
+	}
+	return session, err
+}
+
+func (s *Service) UpdatePresentation(ctx context.Context, eventID, id uuid.UUID, settings PresentationSettings) (Session, error) {
+	if settings.ContentPolicy == nil && settings.CTAEveryMedia == nil && settings.LayoutMode == nil && settings.SlideDuration == nil && settings.QRStrategy == nil && settings.ArrivalBehavior == nil {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.ContentPolicy != nil && *settings.ContentPolicy != ContentPolicyAutoApproved && *settings.ContentPolicy != ContentPolicyFeaturedOnly {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.CTAEveryMedia != nil && (*settings.CTAEveryMedia < MinCTAEveryMedia || *settings.CTAEveryMedia > MaxCTAEveryMedia) {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.LayoutMode != nil && *settings.LayoutMode != LayoutModeSpotlight && *settings.LayoutMode != LayoutModeMosaic && *settings.LayoutMode != LayoutModeFeatured {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.SlideDuration != nil && (*settings.SlideDuration < MinSlideDuration || *settings.SlideDuration > MaxSlideDuration) {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.QRStrategy != nil && *settings.QRStrategy != QRStrategyInterval && *settings.QRStrategy != QRStrategyAlways && *settings.QRStrategy != QRStrategyEmptyOnly && *settings.QRStrategy != QRStrategyHidden {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.ArrivalBehavior != nil && *settings.ArrivalBehavior != ArrivalBehaviorQueue && *settings.ArrivalBehavior != ArrivalBehaviorNext {
+		return Session{}, ErrInvalidPresentation
+	}
+	session, err := s.repo.UpdatePresentation(ctx, eventID, id, settings)
 	if err == nil {
 		s.notify(ctx, session, "")
 	}
