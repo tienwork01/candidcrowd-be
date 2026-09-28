@@ -150,6 +150,8 @@ type uploadRequest struct {
 	ChecksumSHA256    string `json:"checksum_sha256" binding:"required,len=64,hexadecimal"`
 	ClientUploadID    string `json:"client_upload_id" binding:"required,uuid4"`
 	GuestSessionToken string `json:"guest_session_token" binding:"required"`
+	GuestName         string `json:"guest_name" binding:"omitempty,max=80"`
+	Caption           string `json:"caption" binding:"omitempty,max=1000"`
 }
 
 func (h *PublicHandler) CreateUpload(c *gin.Context) {
@@ -183,6 +185,8 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 		Size:           req.Size,
 		ChecksumSHA256: req.ChecksumSHA256,
 		ClientUploadID: clientUploadID,
+		GuestName:      req.GuestName,
+		Caption:        req.Caption,
 		SessionToken:   req.GuestSessionToken,
 	})
 	if err != nil {

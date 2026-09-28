@@ -79,6 +79,8 @@ type CreateInput struct {
 	ChecksumSHA256     string
 	SessionToken       string
 	ClientUploadID     uuid.UUID
+	GuestName          string
+	Caption            string
 }
 type UploadTarget struct {
 	MediaID         uuid.UUID         `json:"media_id"`
@@ -127,7 +129,7 @@ func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in Create
 			return UploadTarget{}, fmt.Errorf("upload rate limit exceeded")
 		}
 		clientID := in.ClientUploadID
-		m = Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, ExpectedSize: in.Size, ChecksumSHA256: strings.ToLower(in.ChecksumSHA256), ClientUploadID: &clientID, Status: StatusPending, LastActivityAt: time.Now()}
+		m = Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, GuestName: optionalText(in.GuestName), Caption: optionalText(in.Caption), ExpectedSize: in.Size, ChecksumSHA256: strings.ToLower(in.ChecksumSHA256), ClientUploadID: &clientID, Status: StatusPending, LastActivityAt: time.Now()}
 		m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", scope.EventID, m.ID, extension(in.MIMEType))
 		err = s.repo.ReserveUpload(ctx, m, scope.MaxEventBytes)
 		if err != nil {
@@ -157,6 +159,14 @@ func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in Create
 			"Cache-Control": "private, max-age=1800",
 		},
 	}, nil
+}
+
+func optionalText(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func (s *Service) Complete(ctx context.Context, scope UploadScope, mediaID uuid.UUID) error {
@@ -595,6 +605,8 @@ func newPublicView(record Media, urlFor func(uuid.UUID) string) PublicView {
 		HasEventFrame:  strings.HasPrefix(record.OriginalFilename, "candid_"),
 		ThumbnailReady: record.ThumbnailReady,
 		Status:         record.Status,
+		GuestName:      record.GuestName,
+		Caption:        record.Caption,
 		objectKey:      record.ObjectKey,
 		thumbnailKey:   thumbnailKey(record),
 		routeURL:       route,

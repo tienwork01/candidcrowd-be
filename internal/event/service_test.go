@@ -189,6 +189,9 @@ func (r *inMemoryEventRepo) UpdateOwned(ctx context.Context, id, hostID uuid.UUI
 	if theme, ok := updates["guest_theme"].(*datatypes.JSON); ok {
 		e.GuestTheme = theme
 	}
+	if config, ok := updates["qr_config"].(*datatypes.JSON); ok {
+		e.QRConfig = config
+	}
 	if updated, ok := updates["updated_at"].(time.Time); ok {
 		e.UpdatedAt = updated
 	}
@@ -614,6 +617,7 @@ func TestService_Update_GuestTheme(t *testing.T) {
 	require.NoError(t, err)
 
 	themeJSON := datatypes.JSON([]byte(`{"presetId":"botanical","primaryColor":"#2d5a3f"}`))
+	qrConfigJSON := datatypes.JSON([]byte(`{"fgColor":"#181e17","dotType":"rounded"}`))
 	newName := "Updated Botanical Wedding"
 	newCount := 150
 	gallery := false
@@ -623,6 +627,7 @@ func TestService_Update_GuestTheme(t *testing.T) {
 		ExpectedGuestCount: &newCount,
 		GalleryEnabled:     &gallery,
 		GuestTheme:         &themeJSON,
+		QRConfig:           &qrConfigJSON,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "Updated Botanical Wedding", updated.Name)
@@ -630,4 +635,18 @@ func TestService_Update_GuestTheme(t *testing.T) {
 	require.False(t, updated.GalleryEnabled)
 	require.NotNil(t, updated.GuestTheme)
 	require.JSONEq(t, `{"presetId":"botanical","primaryColor":"#2d5a3f"}`, string(*updated.GuestTheme))
+	require.NotNil(t, updated.QRConfig)
+	require.JSONEq(t, `{"fgColor":"#181e17","dotType":"rounded"}`, string(*updated.QRConfig))
+}
+
+func TestService_Update_RejectsInvalidQRConfig(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	svc := NewService(repo, 100*1024*1024)
+	hostID := uuid.New()
+	created, err := svc.Create(context.Background(), hostID, CreateInput{Name: "Event"})
+	require.NoError(t, err)
+
+	invalid := datatypes.JSON([]byte(`{"fgColor":"blue"}`))
+	_, err = svc.Update(context.Background(), created.ID, hostID, UpdateInput{QRConfig: &invalid})
+	require.ErrorContains(t, err, "fgColor")
 }

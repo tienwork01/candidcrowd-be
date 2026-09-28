@@ -47,6 +47,7 @@ type CreateInput struct {
 	Name, EventType    string
 	EventDate          *time.Time
 	ExpectedGuestCount int
+	ClientRequestID *uuid.UUID
 }
 
 type UpdateInput struct {
@@ -61,6 +62,7 @@ type UpdateInput struct {
 	SetupChecklist      *datatypes.JSON
 	CandidCameraEnabled *bool
 	GuestTheme          *datatypes.JSON
+	QRConfig            *datatypes.JSON
 }
 
 type ListInput struct {
@@ -94,6 +96,7 @@ func (s *Service) Create(ctx context.Context, hostID uuid.UUID, in CreateInput) 
 		Status:             StatusActive,
 		GalleryEnabled:     true,
 		MaxMediaBytes:      s.eventMaxBytes,
+		ClientRequestID:    in.ClientRequestID,
 	}
 	if err := s.repo.Create(ctx, &evt); err != nil {
 		return Event{}, err
@@ -199,6 +202,12 @@ func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInp
 	}
 	if in.GuestTheme != nil {
 		updates["guest_theme"] = in.GuestTheme
+	}
+	if in.QRConfig != nil {
+		if err := validateQRConfig(*in.QRConfig); err != nil {
+			return Event{}, err
+		}
+		updates["qr_config"] = in.QRConfig
 	}
 	if len(updates) > 0 {
 		updates["updated_at"] = time.Now().UTC()

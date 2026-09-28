@@ -261,7 +261,7 @@ func TestServiceCreatesAndCompletesWithoutInfrastructure(t *testing.T) {
 	service := NewService(repo, memoryStorage{head: ObjectInfo{Size: 42, ContentType: "image/jpeg"}}, allowAllLimiter{}, time.Minute, time.Minute, 1, 100, 100)
 	scope := UploadScope{EventID: uuid.New(), GuestSessionID: uuid.New(), Accepting: true, MaxEventBytes: 1_000}
 
-	input := CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", ClientUploadID: uuid.New()}
+	input := CreateInput{Filename: "guest.jpg", MIMEType: "image/jpeg", Size: 42, ChecksumSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", ClientUploadID: uuid.New(), GuestName: " Linh ", Caption: " A joyful moment "}
 	target, err := service.CreateUpload(context.Background(), scope, input)
 	require.NoError(t, err)
 	require.NotEmpty(t, target.UploadURL)
@@ -272,6 +272,8 @@ func TestServiceCreatesAndCompletesWithoutInfrastructure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StatusReady, record.Status)
 	require.EqualValues(t, 42, *record.ActualSize)
+	require.Equal(t, "Linh", *record.GuestName)
+	require.Equal(t, "A joyful moment", *record.Caption)
 }
 
 func TestServiceRejectsReadyChecksumInSameEvent(t *testing.T) {

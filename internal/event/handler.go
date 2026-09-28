@@ -27,6 +27,7 @@ type createRequest struct {
 	EventType          string     `json:"event_type" binding:"omitempty,max=80"`
 	EventDate          *time.Time `json:"event_date"`
 	ExpectedGuestCount int        `json:"expected_guest_count" binding:"gte=0"`
+	ClientRequestID string `json:"client_request_id" binding:"omitempty,uuid4"`
 }
 
 type updateRequest struct {
@@ -41,6 +42,7 @@ type updateRequest struct {
 	SetupChecklist      *datatypes.JSON `json:"setup_checklist"`
 	CandidCameraEnabled *bool           `json:"candid_camera_enabled"`
 	GuestTheme          *datatypes.JSON `json:"guest_theme"`
+	QRConfig            *datatypes.JSON `json:"qr_config"`
 }
 
 func (h *Handler) Create(c *gin.Context) {
@@ -67,11 +69,14 @@ func (h *Handler) Create(c *gin.Context) {
 		apierror.Respond(c, err)
 		return
 	}
+	var clientRequestID *uuid.UUID
+	if req.ClientRequestID != "" { parsed, parseErr := uuid.Parse(req.ClientRequestID); if parseErr != nil { apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", "client_request_id must be a UUID")); return }; clientRequestID = &parsed }
 	created, err := h.service.Create(c.Request.Context(), view.ID, CreateInput{
 		Name:               req.Name,
 		EventType:          req.EventType,
 		EventDate:          req.EventDate,
 		ExpectedGuestCount: req.ExpectedGuestCount,
+		ClientRequestID: clientRequestID,
 	})
 	if err != nil {
 		apierror.Respond(c, err)
@@ -184,6 +189,7 @@ func (h *Handler) Update(c *gin.Context) {
 		SetupChecklist:      req.SetupChecklist,
 		CandidCameraEnabled: req.CandidCameraEnabled,
 		GuestTheme:          req.GuestTheme,
+		QRConfig:            req.QRConfig,
 	})
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {

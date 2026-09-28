@@ -24,6 +24,7 @@ const (
 type Event struct {
 	ID                  uuid.UUID       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	HostID              uuid.UUID       `gorm:"type:uuid;not null;index" json:"host_id"`
+	ClientRequestID     *uuid.UUID       `gorm:"type:uuid" json:"-"`
 	Name                string          `json:"name"`
 	Slug                string          `gorm:"uniqueIndex" json:"slug"`
 	EventDate           *time.Time      `json:"event_date"`
@@ -36,6 +37,7 @@ type Event struct {
 	SetupChecklist      datatypes.JSON  `gorm:"type:jsonb" json:"setup_checklist"`
 	CandidCameraEnabled bool            `json:"candid_camera_enabled"`
 	GuestTheme          *datatypes.JSON `gorm:"type:jsonb" json:"guest_theme,omitempty"`
+	QRConfig            *datatypes.JSON `gorm:"type:jsonb" json:"qr_config,omitempty"`
 	MaxMediaBytes       int64           `json:"max_media_bytes"`
 	UsedMediaBytes      int64           `json:"used_media_bytes"`
 	// ReservedMediaBytes counts quota taken by uploads that have not completed.

@@ -29,6 +29,8 @@ type Media struct {
 	ObjectKey        string    `gorm:"uniqueIndex"`
 	OriginalFilename string
 	MIMEType         string
+	GuestName        *string
+	Caption          *string
 	ExpectedSize     int64
 	ActualSize       *int64
 	ChecksumSHA256   string `gorm:"column:checksum_sha256"`
@@ -98,6 +100,8 @@ type Item struct {
 	HasEventFrame  bool      `json:"has_event_frame"`
 	ThumbnailReady bool      `json:"thumbnail_ready"`
 	Status         Status    `json:"status"`
+	GuestName      *string   `json:"guest_name,omitempty"`
+	Caption        *string   `json:"caption,omitempty"`
 }
 
 // Change describes a media change worth telling connected browsers about.
@@ -125,6 +129,8 @@ func newItem(m Media) Item {
 		HasEventFrame:  strings.HasPrefix(m.OriginalFilename, "candid_"),
 		ThumbnailReady: m.ThumbnailReady,
 		Status:         m.Status,
+		GuestName:      m.GuestName,
+		Caption:        m.Caption,
 	}
 }
 
@@ -143,6 +149,8 @@ type PublicView struct {
 	HasEventFrame  bool      `json:"has_event_frame"`
 	ThumbnailReady bool      `json:"thumbnail_ready"`
 	Status         Status    `json:"status"`
+	GuestName      *string   `json:"guest_name,omitempty"`
+	Caption        *string   `json:"caption,omitempty"`
 	objectKey      string
 	thumbnailKey   string
 	// routeURL is the application route kept as the fallback for media whose
