@@ -29,6 +29,7 @@ type RouterConfig struct {
 	Exports        *ExportHandler
 	LiveWall       *LiveWallHandler
 	Public         *PublicHandler
+	QRLogo         *QRLogoHandler
 	// Stream is nil when realtime is disabled for the deployment, in which
 	// case the stream routes are simply not mounted.
 	Stream *StreamHandler
@@ -63,6 +64,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	host.GET("", cfg.Events.List)
 	host.GET("/:id", cfg.Events.Get)
 	host.PATCH("/:id", cfg.Events.Update)
+	host.POST("/:id/qr-logo", cfg.QRLogo.Upload)
+	host.POST("/:id/qr-logo/upload-target", cfg.QRLogo.CreateUploadTarget)
+	host.POST("/:id/qr-logo/:assetId/complete", cfg.QRLogo.Complete)
 	host.DELETE("/:id", cfg.Events.Delete)
 	host.POST("/:id/exports", cfg.Exports.Create)
 	host.GET("/:id/exports/:exportId", cfg.Exports.Get)
@@ -90,6 +94,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		pub.GET("/stream", cfg.Stream.Public)
 	}
 	pub.GET("/media", cfg.Public.Media)
+	pub.GET("/qr-logo/:assetId", cfg.QRLogo.Content)
 	pub.GET("/media/:mediaId/content", cfg.Public.MediaContent)
 	pub.POST("/sessions", cfg.Public.CreateSession)
 	pub.POST("/uploads", cfg.Public.CreateUpload)

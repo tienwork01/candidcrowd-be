@@ -9,7 +9,13 @@ import (
 )
 
 func Open(url string, maxOpen, maxIdle int, lifetime time.Duration) (*gorm.DB, *sql.DB, error) {
-	db, err := gorm.Open(postgres.Open(url), &gorm.Config{TranslateError: true, PrepareStmt: true})
+	// The production Neon URL uses its transaction pooler. Prepared statements
+	// are connection-local, so both GORM's and pgx's statement caches must stay
+	// off when a later request can receive a different PostgreSQL connection.
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		DSN:                  url,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, nil, err
 	}

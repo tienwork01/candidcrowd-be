@@ -69,6 +69,7 @@ func (n *Notifier) LiveWallChanged(ctx context.Context, change livewall.Change) 
 		"slide_duration_seconds": session.SlideDuration,
 		"qr_strategy":            session.QRStrategy,
 		"arrival_behavior":       session.ArrivalBehavior,
+		"transition_mode":        session.TransitionMode,
 	})
 	if err != nil {
 		n.log.Error("realtime: could not build live wall message", "event_id", session.EventID, "error", err)

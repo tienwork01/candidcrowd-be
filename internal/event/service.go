@@ -47,7 +47,7 @@ type CreateInput struct {
 	Name, EventType    string
 	EventDate          *time.Time
 	ExpectedGuestCount int
-	ClientRequestID *uuid.UUID
+	ClientRequestID    *uuid.UUID
 }
 
 type UpdateInput struct {
@@ -87,16 +87,19 @@ func (s *Service) Create(ctx context.Context, hostID uuid.UUID, in CreateInput) 
 		return Event{}, fmt.Errorf("expected guest count cannot be negative")
 	}
 	evt := Event{
-		HostID:             hostID,
-		Name:               strings.TrimSpace(in.Name),
-		Slug:               slug(),
-		EventDate:          in.EventDate,
-		EventType:          defaultType(in.EventType),
-		ExpectedGuestCount: in.ExpectedGuestCount,
-		Status:             StatusActive,
-		GalleryEnabled:     true,
-		MaxMediaBytes:      s.eventMaxBytes,
-		ClientRequestID:    in.ClientRequestID,
+		HostID:              hostID,
+		Name:                strings.TrimSpace(in.Name),
+		Slug:                slug(),
+		EventDate:           in.EventDate,
+		EventType:           defaultType(in.EventType),
+		ExpectedGuestCount:  in.ExpectedGuestCount,
+		Status:              StatusActive,
+		GalleryEnabled:      true,
+		EventMode:           "social",
+		SetupChecklist:      datatypes.JSON([]byte("{}")),
+		CandidCameraEnabled: true,
+		MaxMediaBytes:       s.eventMaxBytes,
+		ClientRequestID:     in.ClientRequestID,
 	}
 	if err := s.repo.Create(ctx, &evt); err != nil {
 		return Event{}, err

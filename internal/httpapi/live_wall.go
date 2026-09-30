@@ -69,7 +69,7 @@ func (h *LiveWallHandler) Create(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusCreated, gin.H{"id": session.ID, "token": token, "expires_at": session.ExpiresAt, "status": session.Status, "show_cta": session.ShowCTA, "content_policy": session.ContentPolicy, "cta_every_media": session.CTAEveryMedia, "layout_mode": session.LayoutMode, "slide_duration_seconds": session.SlideDuration, "qr_strategy": session.QRStrategy, "arrival_behavior": session.ArrivalBehavior, "revision": session.Revision})
+	c.JSON(http.StatusCreated, gin.H{"id": session.ID, "token": token, "expires_at": session.ExpiresAt, "status": session.Status, "show_cta": session.ShowCTA, "content_policy": session.ContentPolicy, "cta_every_media": session.CTAEveryMedia, "layout_mode": session.LayoutMode, "slide_duration_seconds": session.SlideDuration, "qr_strategy": session.QRStrategy, "arrival_behavior": session.ArrivalBehavior, "transition_mode": session.TransitionMode, "revision": session.Revision})
 }
 
 func (h *LiveWallHandler) Get(c *gin.Context) {
@@ -114,6 +114,7 @@ type liveWallUpdateRequest struct {
 	SlideDuration    *int                      `json:"slide_duration_seconds"`
 	QRStrategy       *livewall.QRStrategy      `json:"qr_strategy"`
 	ArrivalBehavior  *livewall.ArrivalBehavior `json:"arrival_behavior"`
+	TransitionMode   *livewall.TransitionMode  `json:"transition_mode"`
 	ExpectedRevision *int64                    `json:"expected_revision"`
 }
 
@@ -135,7 +136,7 @@ func (h *LiveWallHandler) Update(c *gin.Context) {
 	session, err := h.sessions.UpdatePresentation(c.Request.Context(), evt.ID, id, livewall.PresentationSettings{
 		ContentPolicy: request.ContentPolicy, CTAEveryMedia: request.CTAEveryMedia,
 		LayoutMode: request.LayoutMode, SlideDuration: request.SlideDuration,
-		QRStrategy: request.QRStrategy, ArrivalBehavior: request.ArrivalBehavior,
+		QRStrategy: request.QRStrategy, ArrivalBehavior: request.ArrivalBehavior, TransitionMode: request.TransitionMode,
 		ExpectedRevision: request.ExpectedRevision,
 	})
 	if errors.Is(err, livewall.ErrInvalidPresentation) {
@@ -239,6 +240,7 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 			"slide_duration_seconds": session.SlideDuration,
 			"qr_strategy":            session.QRStrategy,
 			"arrival_behavior":       session.ArrivalBehavior,
+			"transition_mode":        session.TransitionMode,
 		},
 		"data": items.Data,
 		"page": gin.H{"next_cursor": items.NextCursor, "has_more": items.HasMore},

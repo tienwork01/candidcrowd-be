@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"errors"
+	"log/slog"
 
 	"net/http"
 	"strconv"
@@ -125,15 +126,11 @@ func (h *PublicHandler) CreateSession(c *gin.Context) {
 	var source *string
 	if h.insights != nil {
 		validatedSource, sourceErr := h.insights.ValidateSource(c.Request.Context(), evt.ID, c.Query("source"))
-		if sourceErr != nil {
-			if errors.Is(sourceErr, insights.ErrNotFound) {
-				apierror.Respond(c, apierror.New(http.StatusNotFound, "source_not_found", "QR source not found"))
-			} else {
-				apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_source", sourceErr.Error()))
-			}
-			return
+		if sourceErr == nil {
+			source = validatedSource
 		}
-		source = validatedSource
+		// QR source attribution is optional analytics. A retired QR sign or a
+		// malformed source parameter must never prevent a guest from uploading.
 	}
 	_, token, err := h.guests.Create(c.Request.Context(), evt.ID, source)
 	if err != nil {
@@ -194,6 +191,13 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 			apierror.Respond(c, apierror.New(http.StatusConflict, "duplicate_media", "this file has already been uploaded to this event"))
 			return
 		}
+		slog.Warn("guest upload target rejected",
+			"event_id", evt.ID,
+			"mime_type", req.MIMEType,
+			"size", req.Size,
+			"reason", err,
+			"request_id", c.GetString("request_id"),
+		)
 		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_not_allowed", err.Error()))
 		return
 	}

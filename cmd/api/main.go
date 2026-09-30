@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -47,7 +48,16 @@ func run() error {
 	if cfg.Env != "development" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level(cfg.LogLevel)}))
+	logWriter := io.Writer(os.Stdout)
+	if cfg.Env == "development" {
+		logFile, openErr := os.OpenFile("tmp/api.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			defer logFile.Close()
+			logWriter = io.MultiWriter(os.Stdout, logFile)
+		}
+	}
+	logger := slog.New(slog.NewJSONHandler(logWriter, &slog.HandlerOptions{Level: level(cfg.LogLevel)}))
+	slog.SetDefault(logger)
 	db, sqlDB, err := database.Open(cfg.DatabaseURL, cfg.DBMaxOpen, cfg.DBMaxIdle, cfg.DBConnLifetime)
 	if err != nil {
 		return err
@@ -215,6 +225,7 @@ func run() error {
 		Exports:        httpapi.NewExportHandler(events, profiles, exports),
 		LiveWall:       httpapi.NewLiveWallHandler(events, profiles, uploads, liveWall, realtimeHub),
 		Public:         httpapi.NewPublicHandler(events, guests, uploads, analytics, archiveReaders...),
+		QRLogo:         httpapi.NewQRLogoHandler(events, profiles, storage, cfg.PresignExpiry),
 		Stream:         streamHandler(cfg, events, profiles, realtimeHub, limiter),
 	})
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}

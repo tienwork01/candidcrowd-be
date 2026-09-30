@@ -44,7 +44,7 @@ func (r *MediaRepository) ReserveUpload(ctx context.Context, record media.Media,
 			SET reserved_media_bytes = reserved_media_bytes + ?
 			WHERE id = ?
 			  AND status = ?
-			  AND used_media_bytes + reserved_media_bytes + ? <= COALESCE(NULLIF(?, 0), max_media_bytes)`,
+			  AND used_media_bytes + reserved_media_bytes + ? <= COALESCE(NULLIF(?::bigint, 0::bigint), max_media_bytes)`,
 			record.ExpectedSize, record.EventID, event.StatusActive, record.ExpectedSize, maxEventBytes)
 		if reserve.Error != nil {
 			return reserve.Error

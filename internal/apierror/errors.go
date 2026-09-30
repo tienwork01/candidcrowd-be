@@ -2,6 +2,7 @@ package apierror
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -20,5 +21,11 @@ func Respond(c *gin.Context, err error) {
 		c.JSON(api.Status, gin.H{"error": gin.H{"code": api.Code, "message": api.Message}})
 		return
 	}
+	slog.Error("unhandled API error",
+		"error", err,
+		"method", c.Request.Method,
+		"path", c.FullPath(),
+		"request_id", c.GetString("request_id"),
+	)
 	c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "internal_error", "message": "an unexpected error occurred"}})
 }

@@ -231,6 +231,9 @@ func TestEventCreateAndIsolation(t *testing.T) {
 	require.Equal(t, "Host 1 Wedding", e1.Name)
 	require.Equal(t, StatusActive, e1.Status)
 	require.NotEmpty(t, e1.Slug)
+	require.Equal(t, "social", e1.EventMode)
+	require.JSONEq(t, "{}", string(e1.SetupChecklist))
+	require.True(t, e1.CandidCameraEnabled)
 
 	// Host 2 creates an event
 	e2, err := svc.Create(ctx, host2ID, CreateInput{

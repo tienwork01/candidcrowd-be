@@ -27,6 +27,7 @@ type ContentPolicy string
 type LayoutMode string
 type QRStrategy string
 type ArrivalBehavior string
+type TransitionMode string
 
 const (
 	StatusLive    Status = "live"
@@ -49,8 +50,12 @@ const (
 	QRStrategyEmptyOnly QRStrategy = "empty_only"
 	QRStrategyHidden    QRStrategy = "hidden"
 
-	ArrivalBehaviorQueue ArrivalBehavior = "queue"
-	ArrivalBehaviorNext  ArrivalBehavior = "next"
+	ArrivalBehaviorQueue    ArrivalBehavior = "queue"
+	ArrivalBehaviorNext     ArrivalBehavior = "next"
+	TransitionModeClassic   TransitionMode  = "classic"
+	TransitionModeCinematic TransitionMode  = "cinematic"
+	TransitionModeFloat3D   TransitionMode  = "float_3d"
+	TransitionModeFlash     TransitionMode  = "flash"
 )
 
 const (
@@ -78,6 +83,7 @@ type Session struct {
 	SlideDuration   int             `gorm:"column:slide_duration_seconds;not null;default:5" json:"slide_duration_seconds"`
 	QRStrategy      QRStrategy      `gorm:"not null;default:interval" json:"qr_strategy"`
 	ArrivalBehavior ArrivalBehavior `gorm:"not null;default:queue" json:"arrival_behavior"`
+	TransitionMode  TransitionMode  `gorm:"not null;default:cinematic" json:"transition_mode"`
 	Revision        int64           `gorm:"not null;default:0" json:"revision"`
 	ExpiresAt       time.Time       `json:"expires_at"`
 	CreatedAt       time.Time       `json:"created_at"`
@@ -119,6 +125,7 @@ type PresentationSettings struct {
 	SlideDuration    *int
 	QRStrategy       *QRStrategy
 	ArrivalBehavior  *ArrivalBehavior
+	TransitionMode   *TransitionMode
 	ExpectedRevision *int64
 }
 
@@ -241,6 +248,9 @@ func (r *gormRepository) UpdatePresentation(ctx context.Context, eventID, id uui
 	if settings.ArrivalBehavior != nil {
 		updates["arrival_behavior"] = *settings.ArrivalBehavior
 	}
+	if settings.TransitionMode != nil {
+		updates["transition_mode"] = *settings.TransitionMode
+	}
 	var session Session
 	db := r.db.WithContext(ctx).Model(&session).Clauses(clause.Returning{}).
 		Where("id = ? AND event_id = ? AND status = ?", id, eventID, StatusLive)
@@ -290,7 +300,7 @@ func (s *Service) Create(ctx context.Context, eventID uuid.UUID, eventName, even
 	// A fresh wall should show successfully uploaded guest media immediately.
 	// Hosts can still switch to featured_only from the live controls when they
 	// need a curated display.
-	session := Session{ID: uuid.New(), EventID: eventID, EventName: eventName, EventSlug: eventSlug, TokenHash: tokenHash(token), Status: StatusLive, ContentPolicy: ContentPolicyAutoApproved, CTAEveryMedia: DefaultCTAEveryMedia, LayoutMode: LayoutModeSpotlight, SlideDuration: DefaultSlideDuration, QRStrategy: QRStrategyInterval, ArrivalBehavior: ArrivalBehaviorQueue, ExpiresAt: now.Add(s.lifetime), CreatedAt: now}
+	session := Session{ID: uuid.New(), EventID: eventID, EventName: eventName, EventSlug: eventSlug, TokenHash: tokenHash(token), Status: StatusLive, ContentPolicy: ContentPolicyAutoApproved, CTAEveryMedia: DefaultCTAEveryMedia, LayoutMode: LayoutModeSpotlight, SlideDuration: DefaultSlideDuration, QRStrategy: QRStrategyInterval, ArrivalBehavior: ArrivalBehaviorQueue, TransitionMode: TransitionModeCinematic, ExpiresAt: now.Add(s.lifetime), CreatedAt: now}
 	created, err := s.repo.Create(ctx, session)
 	return created, token, err
 }
@@ -334,7 +344,7 @@ func (s *Service) UpdateCTAEveryMedia(ctx context.Context, eventID, id uuid.UUID
 }
 
 func (s *Service) UpdatePresentation(ctx context.Context, eventID, id uuid.UUID, settings PresentationSettings) (Session, error) {
-	if settings.ContentPolicy == nil && settings.CTAEveryMedia == nil && settings.LayoutMode == nil && settings.SlideDuration == nil && settings.QRStrategy == nil && settings.ArrivalBehavior == nil {
+	if settings.ContentPolicy == nil && settings.CTAEveryMedia == nil && settings.LayoutMode == nil && settings.SlideDuration == nil && settings.QRStrategy == nil && settings.ArrivalBehavior == nil && settings.TransitionMode == nil {
 		return Session{}, ErrInvalidPresentation
 	}
 	if settings.ContentPolicy != nil && *settings.ContentPolicy != ContentPolicyAutoApproved && *settings.ContentPolicy != ContentPolicyFeaturedOnly {
@@ -353,6 +363,9 @@ func (s *Service) UpdatePresentation(ctx context.Context, eventID, id uuid.UUID,
 		return Session{}, ErrInvalidPresentation
 	}
 	if settings.ArrivalBehavior != nil && *settings.ArrivalBehavior != ArrivalBehaviorQueue && *settings.ArrivalBehavior != ArrivalBehaviorNext {
+		return Session{}, ErrInvalidPresentation
+	}
+	if settings.TransitionMode != nil && *settings.TransitionMode != TransitionModeClassic && *settings.TransitionMode != TransitionModeCinematic && *settings.TransitionMode != TransitionModeFloat3D && *settings.TransitionMode != TransitionModeFlash {
 		return Session{}, ErrInvalidPresentation
 	}
 	session, err := s.repo.UpdatePresentation(ctx, eventID, id, settings)
