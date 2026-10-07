@@ -60,6 +60,6 @@ the deployment-time pull; no long-lived registry password is copied to the
 repository. Ensure the GHCR package is linked to this repository so its Actions
 token can read it.
 
-Pushes to `main` deploy the immutable commit-SHA image. Compose waits until the
-existing `/readyz` endpoint confirms that the API can reach the external
+Pushes to `master` deploy the immutable commit-SHA image. Compose waits until
+the existing `/readyz` endpoint confirms that the API can reach the external
 PostgreSQL and Redis services.
