@@ -78,16 +78,6 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           ssh-keyscan -H "$VPS_HOST" >> "$HOME/.ssh/known_hosts"
 
-      - name: Log VPS in to GHCR
-        shell: bash
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-        run: |
-          printf '%s' "$GHCR_TOKEN" | ssh "$VPS_USER@$VPS_HOST" \
-            "docker login ghcr.io --username '$GITHUB_ACTOR' --password-stdin"
-
       - name: Deploy and verify readiness
         shell: bash
         env:
@@ -96,19 +86,34 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           ssh "$VPS_USER@$VPS_HOST" \
-            "DEPLOY_IMAGE='$IMAGE_NAME:$GITHUB_SHA' bash -se" <<'REMOTE'
+            "API_IMAGE='$IMAGE_NAME:$GITHUB_SHA' bash -se" <<'REMOTE'
           set -Eeuo pipefail
 
           cd /opt/candid-crowd
           test -f docker-compose.yml
           test -f .env
 
-          export API_IMAGE="$DEPLOY_IMAGE"
+          export API_IMAGE
           docker compose config --quiet
-          docker compose pull
-          docker compose up -d --wait --wait-timeout 180
+          docker compose pull api
+          docker compose up -d --wait --wait-timeout 180 api
 
-          response="$(docker compose exec -T api wget -q -O - http://127.0.0.1:8080/readyz)"
-          printf '%s\n' "$response"
-          printf '%s' "$response" | grep -q '"status":"ready"'
+          ready=false
+          for attempt in $(seq 1 36); do
+            if response="$(curl --fail --silent http://127.0.0.1:8080/readyz)" \
+              && printf '%s' "$response" | grep -q '"status":"ready"'; then
+              printf '%s\n' "$response"
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$ready" != true ]; then
+            echo "API readiness check failed" >&2
+            docker compose logs --tail=100 api >&2
+            exit 1
+          fi
+
+          docker image prune -f
           REMOTE

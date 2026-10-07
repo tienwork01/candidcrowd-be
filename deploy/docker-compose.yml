@@ -2,7 +2,7 @@ name: candid-crowd
 
 services:
   api:
-    image: ${API_IMAGE:?set API_IMAGE in /opt/candid-crowd/.env}
+    image: ${API_IMAGE:-ghcr.io/tienwork01/candidcrowd-be:latest}
     env_file:
       - .env
     environment:
@@ -22,12 +22,6 @@ services:
     cap_drop:
       - ALL
     stop_grace_period: 35s
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 15s
     logging:
       driver: local
       options:
