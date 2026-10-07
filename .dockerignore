@@ -1,5 +1,7 @@
 .git
+.github
 .agents
+.claude
 .env
 .env.*
 !.env.example
@@ -8,6 +10,8 @@ tmp
 coverage.out
 vendor
 docs
+deploy
 Dockerfile
 docker-compose*.yml
 README.md
+**/*_test.go
