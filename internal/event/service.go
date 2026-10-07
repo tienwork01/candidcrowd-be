@@ -2,22 +2,22 @@ package event
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
 
 // Change describes event settings a connected browser reacts to. A guest page
-// must learn that the gallery was switched off or the mode changed without
-// being reloaded.
+// must learn that the gallery was switched on or off without being reloaded.
 type Change struct {
 	EventID        uuid.UUID `json:"-"`
 	GalleryEnabled bool      `json:"gallery_enabled"`
-	EventMode      string    `json:"event_mode"`
 	Status         Status    `json:"status"`
 }
 
@@ -27,16 +27,69 @@ type Notifier interface {
 	EventChanged(ctx context.Context, change Change)
 }
 
+var (
+	ErrActiveEventLimitReached = errors.New("event: active event limit reached")
+	ErrTrialWindowLimitReached = errors.New("event: free trial rolling-window limit reached")
+)
+
 type Service struct {
-	repo          Repository
-	eventMaxBytes int64
-	notifier      Notifier
+	repo            Repository
+	eventMaxBytes   int64
+	notifier        Notifier
+	plans           FeatureGate
+	maxActiveEvents int
+	maxTrialEvents  int
+	trialWindow     time.Duration
+	limitsEnabled   bool
+	now             func() time.Time
+}
+
+// UsePlanGate makes event updates respect the event's plan: saving guest page
+// or QR styling beyond the basic presets requires customization.full.
+func (s *Service) UsePlanGate(gate FeatureGate) *Service {
+	s.plans = gate
+	return s
+}
+
+// WithLimits configures active and rolling-window Free Trial limits per host.
+func (s *Service) WithLimits(maxActive, maxRolling int, enabled bool) *Service {
+	s.maxActiveEvents = maxActive
+	s.maxTrialEvents = maxRolling
+	s.trialWindow = 30 * 24 * time.Hour
+	s.limitsEnabled = enabled
+	return s
+}
+
+// requireFullCustomization checks the plan only when theme or QR styling goes
+// beyond the basic presets. Ownership is confirmed first so a denial can never
+// reveal another host's event.
+func (s *Service) requireFullCustomization(ctx context.Context, id, hostID uuid.UUID, in UpdateInput) error {
+	if s.plans == nil {
+		return nil
+	}
+	full := (in.GuestTheme != nil && !isBasicGuestTheme(*in.GuestTheme)) ||
+		(in.QRConfig != nil && !isBasicQRConfig(*in.QRConfig))
+	if !full {
+		return nil
+	}
+	if _, err := s.repo.GetOwned(ctx, id, hostID); err != nil {
+		return err
+	}
+	return s.plans.Require(ctx, id, catalog.FeatureFullCustomization)
 }
 
 // NewService takes an optional Notifier so realtime broadcast stays a
 // deployment concern rather than a precondition for managing events.
 func NewService(repo Repository, eventMaxBytes int64, notifiers ...Notifier) *Service {
-	s := &Service{repo: repo, eventMaxBytes: eventMaxBytes}
+	s := &Service{
+		repo:            repo,
+		eventMaxBytes:   eventMaxBytes,
+		maxActiveEvents: 1,
+		maxTrialEvents:  2,
+		trialWindow:     30 * 24 * time.Hour,
+		limitsEnabled:   false,
+		now:             time.Now,
+	}
 	if len(notifiers) > 0 {
 		s.notifier = notifiers[0]
 	}
@@ -57,7 +110,6 @@ type UpdateInput struct {
 	ClearEventDate      bool
 	ExpectedGuestCount  *int
 	GalleryEnabled      *bool
-	EventMode           *string
 	LifecyclePhase      *string
 	SetupChecklist      *datatypes.JSON
 	CandidCameraEnabled *bool
@@ -86,6 +138,29 @@ func (s *Service) Create(ctx context.Context, hostID uuid.UUID, in CreateInput) 
 	if in.ExpectedGuestCount < 0 {
 		return Event{}, fmt.Errorf("expected guest count cannot be negative")
 	}
+	if s.limitsEnabled {
+		if s.maxTrialEvents > 0 {
+			count, err := s.repo.CountTrialsSince(ctx, hostID, s.now().Add(-s.trialWindow))
+			if err != nil {
+				return Event{}, fmt.Errorf("check daily event limit: %w", err)
+			}
+			if count >= int64(s.maxTrialEvents) {
+				return Event{}, ErrTrialWindowLimitReached
+			}
+		}
+
+		if s.maxActiveEvents > 0 {
+			count, err := s.repo.CountActiveTrialsByHost(ctx, hostID)
+			if err != nil {
+				return Event{}, fmt.Errorf("check active event limit: %w", err)
+			}
+			if count >= int64(s.maxActiveEvents) {
+				return Event{}, ErrActiveEventLimitReached
+			}
+		}
+	}
+
+	now := s.now().UTC()
 	evt := Event{
 		HostID:              hostID,
 		Name:                strings.TrimSpace(in.Name),
@@ -95,13 +170,21 @@ func (s *Service) Create(ctx context.Context, hostID uuid.UUID, in CreateInput) 
 		ExpectedGuestCount:  in.ExpectedGuestCount,
 		Status:              StatusActive,
 		GalleryEnabled:      true,
-		EventMode:           "social",
 		SetupChecklist:      datatypes.JSON([]byte("{}")),
 		CandidCameraEnabled: true,
 		MaxMediaBytes:       s.eventMaxBytes,
+		TrialStartedAt:      &now,
 		ClientRequestID:     in.ClientRequestID,
 	}
 	if err := s.repo.Create(ctx, &evt); err != nil {
+		if errors.Is(err, ErrDuplicateRequest) {
+			// A retried submit (lost response, double tap) answers with the
+			// event the first attempt created instead of failing.
+			existing, getErr := s.repo.GetByClientRequest(ctx, hostID, *in.ClientRequestID)
+			if getErr == nil {
+				return existing, nil
+			}
+		}
 		return Event{}, err
 	}
 	return evt, nil
@@ -165,7 +248,20 @@ func (s *Service) Delete(ctx context.Context, id, hostID uuid.UUID) error {
 	return s.repo.DeleteOwned(ctx, id, hostID)
 }
 
+func (s *Service) Close(ctx context.Context, id, hostID uuid.UUID) error {
+	if err := s.repo.CloseOwned(ctx, id, hostID); err != nil {
+		return err
+	}
+	if s.notifier != nil {
+		s.notifier.EventChanged(ctx, Change{EventID: id, Status: StatusClosed})
+	}
+	return nil
+}
+
 func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInput) (Event, error) {
+	if err := s.requireFullCustomization(ctx, id, hostID, in); err != nil {
+		return Event{}, err
+	}
 	updates := make(map[string]interface{})
 	if in.Name != nil {
 		trimmed := strings.TrimSpace(*in.Name)
@@ -190,9 +286,6 @@ func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInp
 	}
 	if in.GalleryEnabled != nil {
 		updates["gallery_enabled"] = *in.GalleryEnabled
-	}
-	if in.EventMode != nil {
-		updates["event_mode"] = strings.TrimSpace(*in.EventMode)
 	}
 	if in.LifecyclePhase != nil {
 		updates["lifecycle_phase"] = strings.TrimSpace(*in.LifecyclePhase)
@@ -221,11 +314,10 @@ func (s *Service) Update(ctx context.Context, id, hostID uuid.UUID, in UpdateInp
 	}
 	// Only settings a live page reacts to are broadcast. Renaming an event or
 	// editing its checklist changes nothing a connected browser must redraw.
-	if s.notifier != nil && (in.GalleryEnabled != nil || in.EventMode != nil) {
+	if s.notifier != nil && in.GalleryEnabled != nil {
 		s.notifier.EventChanged(ctx, Change{
 			EventID:        updated.ID,
 			GalleryEnabled: updated.GalleryEnabled,
-			EventMode:      updated.EventMode,
 			Status:         updated.Status,
 		})
 	}

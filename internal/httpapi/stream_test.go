@@ -25,6 +25,9 @@ type stubEventRepo struct {
 }
 
 func (r *stubEventRepo) Create(context.Context, *event.Event) error { return nil }
+func (r *stubEventRepo) GetByClientRequest(context.Context, uuid.UUID, uuid.UUID) (event.Event, error) {
+	return event.Event{}, event.ErrNotFound
+}
 func (r *stubEventRepo) ListByHost(context.Context, uuid.UUID, event.ListFilter) ([]event.Event, int64, error) {
 	return nil, 0, nil
 }
@@ -42,6 +45,13 @@ func (r *stubEventRepo) UpdateOwned(context.Context, uuid.UUID, uuid.UUID, map[s
 	return event.Event{}, event.ErrNotFound
 }
 func (r *stubEventRepo) DeleteOwned(context.Context, uuid.UUID, uuid.UUID) error { return nil }
+func (r *stubEventRepo) CloseOwned(context.Context, uuid.UUID, uuid.UUID) error  { return nil }
+func (r *stubEventRepo) CountActiveTrialsByHost(context.Context, uuid.UUID) (int64, error) {
+	return 0, nil
+}
+func (r *stubEventRepo) CountTrialsSince(context.Context, uuid.UUID, time.Time) (int64, error) {
+	return 0, nil
+}
 
 // loopbackBus is an in-process realtime bus, enough to drive the transport.
 type loopbackBus struct {
@@ -58,7 +68,10 @@ func (b *loopbackBus) Publish(_ context.Context, eventID uuid.UUID, payload []by
 	targets := append([]chan []byte(nil), b.listeners[eventID]...)
 	b.mu.Unlock()
 	for _, target := range targets {
-		target <- payload
+		select {
+		case target <- payload:
+		default:
+		}
 	}
 	return nil
 }

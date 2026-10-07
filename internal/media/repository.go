@@ -27,7 +27,7 @@ type Cursor struct {
 // Implementations must be safe for concurrent use: CompleteMany confirms a
 // batch of uploads in parallel.
 type Repository interface {
-	ReserveUpload(ctx context.Context, record Media, maxEventBytes int64) error
+	ReserveUpload(ctx context.Context, record Media, limits ReserveLimits) error
 	FindByClientUpload(ctx context.Context, eventID, sessionID, clientUploadID uuid.UUID) (Media, error)
 	HasReadyChecksum(ctx context.Context, eventID uuid.UUID, checksumSHA256 string) (bool, error)
 	Delete(ctx context.Context, mediaID uuid.UUID) error
@@ -40,7 +40,7 @@ type Repository interface {
 	DeleteManyForEvent(ctx context.Context, eventID uuid.UUID, mediaIDs []uuid.UUID) error
 	FindUploadForSession(ctx context.Context, mediaID, eventID, sessionID uuid.UUID) (Media, error)
 	MarkReady(ctx context.Context, eventID, mediaID uuid.UUID, actualSize int64, uploadedAt time.Time) error
-	MarkThumbnailReady(ctx context.Context, eventID, mediaID uuid.UUID) error
+	UpdateProcessingResult(ctx context.Context, eventID, mediaID uuid.UUID, thumbnailReady bool, metadata PresentationMetadata) error
 	ListReady(ctx context.Context, eventID uuid.UUID, limit int, before *Cursor) ([]Media, error)
 	ListGallery(ctx context.Context, eventID uuid.UUID, filter GalleryFilter, sort GallerySort, limit int, before *Cursor) ([]Media, error)
 	GalleryCounts(ctx context.Context, eventID uuid.UUID) (GalleryCounts, error)

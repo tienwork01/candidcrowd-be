@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/livewall"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
@@ -176,4 +177,39 @@ func buildOne(eventID uuid.UUID, kind Kind, audience Audience, payload mediaPayl
 		return nil, err
 	}
 	return []Message{msg}, nil
+}
+
+// PlanChanged tells the event's host streams that its plan changed. Guests do
+// not see plans, so the message is host-only.
+func (n *Notifier) PlanChanged(ctx context.Context, change entitlement.PlanChange) {
+	msg, err := planMessage(change)
+	if err != nil {
+		n.log.Error("realtime: could not build plan message", "event_id", change.EventID, "error", err)
+		return
+	}
+	n.dispatch(ctx, []Message{msg})
+}
+
+func planMessage(change entitlement.PlanChange) (Message, error) {
+	return NewMessage(change.EventID, KindEventPlanUpdated, AudienceHost, change)
+}
+
+// SyncPlanNotifier announces plan changes before returning. Short-lived tools
+// such as planctl use it: they exit right after the grant, which would drop a
+// message still waiting in Notifier's background send.
+type SyncPlanNotifier struct {
+	Hub *Hub
+	Log *slog.Logger
+}
+
+func (n SyncPlanNotifier) PlanChanged(ctx context.Context, change entitlement.PlanChange) {
+	msg, err := planMessage(change)
+	if err == nil {
+		publishCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+		defer cancel()
+		err = n.Hub.Publish(publishCtx, msg)
+	}
+	if err != nil && n.Log != nil {
+		n.Log.Error("realtime: plan change not announced", "event_id", change.EventID, "error", err)
+	}
 }

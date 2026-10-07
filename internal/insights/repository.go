@@ -62,10 +62,24 @@ func (r *gormRepository) SourceExists(ctx context.Context, eventID uuid.UUID, co
 
 func (r *gormRepository) Analytics(ctx context.Context, eventID uuid.UUID, expectedGuestCount int) (Analytics, error) {
 	result := Analytics{ExpectedGuestCount: expectedGuestCount, Sources: []SourceMetric{}}
+	// Scan scalar aggregates into flat projections. Scanning directly into
+	// Analytics makes GORM parse Sources as an ORM relationship before the SQL
+	// runs, which fails because SourceMetric is an API projection, not a model.
+	var sessions struct {
+		Scans int64 `gorm:"column:scans"`
+	}
 	if err := r.db.WithContext(ctx).Raw(`
 		SELECT COUNT(*) AS scans
-		FROM guest_sessions WHERE event_id = ?`, eventID).Scan(&result).Error; err != nil {
+		FROM guest_sessions WHERE event_id = ?`, eventID).Scan(&sessions).Error; err != nil {
 		return Analytics{}, err
+	}
+	result.Scans = sessions.Scans
+
+	var mediaTotals struct {
+		Contributors int64 `gorm:"column:contributors"`
+		Media        int64 `gorm:"column:media"`
+		Photos       int64 `gorm:"column:photos"`
+		Videos       int64 `gorm:"column:videos"`
 	}
 	if err := r.db.WithContext(ctx).Raw(`
 		SELECT COUNT(DISTINCT guest_session_id) AS contributors,
@@ -73,9 +87,13 @@ func (r *gormRepository) Analytics(ctx context.Context, eventID uuid.UUID, expec
 		       COUNT(*) FILTER (WHERE mime_type LIKE 'image/%') AS photos,
 		       COUNT(*) FILTER (WHERE mime_type LIKE 'video/%') AS videos
 		FROM media
-		WHERE event_id = ? AND status IN ('ready', 'featured', 'hidden')`, eventID).Scan(&result).Error; err != nil {
+		WHERE event_id = ? AND status IN ('ready', 'featured', 'hidden')`, eventID).Scan(&mediaTotals).Error; err != nil {
 		return Analytics{}, err
 	}
+	result.Contributors = mediaTotals.Contributors
+	result.Media = mediaTotals.Media
+	result.Photos = mediaTotals.Photos
+	result.Videos = mediaTotals.Videos
 	// Uploads are aggregated per session before the join. Joining media
 	// directly would fan the session rows out once per uploaded file, which
 	// counts one guest who shared ten photos as ten scans.

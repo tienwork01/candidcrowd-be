@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
 	"github.com/candidcrowd/candidcrowd-backend/internal/insights"
@@ -23,6 +25,10 @@ type PublicHandler struct {
 	media         *media.Service
 	insights      *insights.Service
 	archiveReader ArchiveReader
+	plans         *entitlement.Service
+	// legacyEventBytes, when set, replaces each event's plan byte limit. It keeps
+	// uploads on the pre-plans cap until entitlement enforcement is switched on.
+	legacyEventBytes int64
 }
 
 func NewPublicHandler(events *event.Service, guests *guest.Service, media *media.Service, insightsService *insights.Service, readers ...ArchiveReader) *PublicHandler {
@@ -51,6 +57,9 @@ func (h *PublicHandler) Event(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// Free events carry a small CandidCrowd credit on the guest page; plans
+	// with branding.remove do not. It never shows before enforcement starts.
+	showBranding := !planGate{plans: h.plans}.view(c, evt.ID).includes(catalog.FeatureRemoveBranding)
 	c.JSON(http.StatusOK, gin.H{
 		"id":              evt.ID,
 		"name":            evt.Name,
@@ -59,6 +68,7 @@ func (h *PublicHandler) Event(c *gin.Context) {
 		"event_type":      evt.EventType,
 		"gallery_enabled": evt.GalleryEnabled,
 		"guest_theme":     evt.GuestTheme,
+		"show_branding":   showBranding,
 	})
 }
 
@@ -134,6 +144,10 @@ func (h *PublicHandler) CreateSession(c *gin.Context) {
 	}
 	_, token, err := h.guests.Create(c.Request.Context(), evt.ID, source)
 	if err != nil {
+		if errors.Is(err, guest.ErrGuestLimitReached) {
+			apierror.Respond(c, apierror.New(http.StatusTooManyRequests, "guest_limit_reached", "this event has reached its guest limit"))
+			return
+		}
 		apierror.Respond(c, err)
 		return
 	}
@@ -171,11 +185,17 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", "client_upload_id must be a UUID"))
 		return
 	}
+	uploadClosed := false
+	if h.plans != nil {
+		uploadClosed = h.plans.UploadsClosed(c.Request.Context(), evt.ID)
+	}
 	target, err := h.media.CreateUpload(c.Request.Context(), media.UploadScope{
 		EventID:        evt.ID,
 		GuestSessionID: session.ID,
 		Accepting:      evt.Status == event.StatusActive,
-		MaxEventBytes:  evt.MaxMediaBytes,
+		MaxEventBytes:  h.maxEventBytes(evt),
+		EnforceItems:   h.enforceItems(),
+		UploadClosed:   uploadClosed,
 	}, media.CreateInput{
 		Filename:       req.Filename,
 		MIMEType:       req.MIMEType,
@@ -189,6 +209,18 @@ func (h *PublicHandler) CreateUpload(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, media.ErrDuplicate) {
 			apierror.Respond(c, apierror.New(http.StatusConflict, "duplicate_media", "this file has already been uploaded to this event"))
+			return
+		}
+		var quota *media.QuotaError
+		if errors.As(err, &quota) {
+			slog.Info("plan.quota_reached",
+				"event_id", evt.ID, "resource", quota.Resource, "usage", quota.Usage, "limit", quota.Limit,
+				"request_id", c.GetString("request_id"))
+			apierror.Respond(c, err)
+			return
+		}
+		if errors.Is(err, media.ErrUploadClosed) {
+			apierror.Respond(c, err)
 			return
 		}
 		slog.Warn("guest upload target rejected",
@@ -246,7 +278,7 @@ func (h *PublicHandler) CompleteBatch(c *gin.Context) {
 		EventID:        evt.ID,
 		GuestSessionID: session.ID,
 		Accepting:      evt.Status == event.StatusActive,
-		MaxEventBytes:  evt.MaxMediaBytes,
+		MaxEventBytes:  h.maxEventBytes(evt),
 	}, ids)
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusUnprocessableEntity, "upload_not_allowed", err.Error()))
@@ -293,7 +325,7 @@ func (h *PublicHandler) Complete(c *gin.Context) {
 		EventID:        evt.ID,
 		GuestSessionID: session.ID,
 		Accepting:      evt.Status == event.StatusActive,
-		MaxEventBytes:  evt.MaxMediaBytes,
+		MaxEventBytes:  h.maxEventBytes(evt),
 	}, id); err != nil {
 		if errors.Is(err, media.ErrNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "upload not found"))
@@ -305,4 +337,27 @@ func (h *PublicHandler) Complete(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// UsePlans applies each event's plan to guest uploads: its item limits and
+// upload window. While enforcement is off, uploads keep the pre-plan byte cap
+// (legacyEventBytes) and item limits are not applied; the upload window is
+// still evaluated, and only logged, in shadow mode.
+func (h *PublicHandler) UsePlans(plans *entitlement.Service, legacyEventBytes int64) *PublicHandler {
+	h.plans = plans
+	if plans == nil || !plans.Enforcing() {
+		h.legacyEventBytes = legacyEventBytes
+	}
+	return h
+}
+
+func (h *PublicHandler) maxEventBytes(evt event.Event) int64 {
+	if h.legacyEventBytes > 0 {
+		return h.legacyEventBytes
+	}
+	return evt.MaxMediaBytes
+}
+
+func (h *PublicHandler) enforceItems() bool {
+	return h.plans != nil && h.plans.Enforcing()
 }

@@ -82,7 +82,7 @@ func TestMediaStatusUpdateReturnsTheModeratedRow(t *testing.T) {
 	eventID, sessionID := seedEvent(t, db, 10_000)
 
 	record := pendingRecord(eventID, sessionID, 100)
-	require.NoError(t, repo.ReserveUpload(ctx, record, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, record, media.ReserveLimits{}))
 	require.NoError(t, repo.MarkReady(ctx, eventID, record.ID, 90, time.Now().UTC()))
 
 	updated, err := repo.UpdateStatus(ctx, eventID, record.ID, media.StatusFeatured)

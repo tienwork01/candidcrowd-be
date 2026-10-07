@@ -61,7 +61,6 @@ Host
 GuestSession
 Media
 QRSource
-EventMode
 Prompt
 ```
 
@@ -326,45 +325,15 @@ Features:
 - Optional gallery browsing
 - Anonymous guest session/token
 
-# Event modes
+# Event participation controls
 
-## Silent Mode
-Mainly for wedding ceremonies.
+Event behavior must use explicit, independent settings rather than a single
+global preset. Examples include gallery visibility, Candid Camera
+availability, photo prompts, and the detailed Live Wall presentation controls.
 
-Behavior:
-- No prompts
-- No live-wall encouragement
-- No gamification
+## Post-event collection
 
-Possible message:
-
-> Enjoy the moment. You can share your photos afterward.
-
-## Soft Mode
-Suitable for cocktail hour / early reception.
-
-Behavior:
-- Gentle CTA
-- QR upload
-- No aggressive prompts
-
-## Social Mode
-Suitable for reception / casual event periods.
-
-Behavior:
-- Live Wall
-- Reactions
-- Optional prompts
-
-## Party Mode
-Suitable for dance floor / afterparty.
-
-Behavior:
-- More playful prompts
-- Optional photo missions
-
-## After-event Mode
-Important core workflow.
+Post-event collection remains an important core workflow.
 
 Guests often do not want to upload during the event.
 
@@ -693,7 +662,6 @@ QRSource
 UploadSession
 Media
 MediaVariant
-EventMode
 EventPrompt
 Reaction
 ModerationAction

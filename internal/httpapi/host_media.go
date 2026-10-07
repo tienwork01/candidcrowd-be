@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
-	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -31,6 +32,13 @@ type HostMediaHandler struct {
 	// storage. Without it a host reviewing an older event would be shown a
 	// signed link to an object that no longer exists.
 	archiveReader ArchiveReader
+	gate          planGate
+}
+
+// UsePlans makes the handler respect each event's plan.
+func (h *HostMediaHandler) UsePlans(plans *entitlement.Service) *HostMediaHandler {
+	h.gate = planGate{plans: plans}
+	return h
 }
 
 func NewHostMediaHandler(events *event.Service, profiles *profile.Service, mediaService *media.Service, readers ...ArchiveReader) *HostMediaHandler {
@@ -42,31 +50,7 @@ func NewHostMediaHandler(events *event.Service, profiles *profile.Service, media
 }
 
 func (h *HostMediaHandler) ownedEvent(c *gin.Context) (event.Event, bool) {
-	eventID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
-		return event.Event{}, false
-	}
-	identity, err := auth.Get(c)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	evt, err := h.events.GetOwned(c.Request.Context(), eventID, hostID)
-	if err != nil {
-		if errors.Is(err, event.ErrNotFound) {
-			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
-		} else {
-			apierror.Respond(c, err)
-		}
-		return event.Event{}, false
-	}
-	return evt, true
+	return resolveOwnedEvent(c, h.events, h.profiles)
 }
 
 func (h *HostMediaHandler) List(c *gin.Context) {
@@ -143,6 +127,11 @@ func (h *HostMediaHandler) UpdateStatus(c *gin.Context) {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", err.Error()))
 		return
 	}
+	// Hiding and showing one photo is a safety tool and is never paid for;
+	// featuring it is.
+	if req.Status == media.StatusFeatured && !h.gate.require(c, evt.ID, catalog.FeatureFeatureMedia) {
+		return
+	}
 	updated, err := h.media.UpdateStatus(c.Request.Context(), evt.ID, mediaID, req.Status)
 	if err != nil {
 		if errors.Is(err, media.ErrNotFound) {
@@ -168,6 +157,13 @@ func (h *HostMediaHandler) BatchUpdateStatus(c *gin.Context) {
 	ids, err := parseMediaIDs(req.IDs)
 	if err != nil {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "media ids must be UUIDs"))
+		return
+	}
+	features := []catalog.Feature{catalog.FeatureBulkModeration}
+	if req.Status == media.StatusFeatured {
+		features = append(features, catalog.FeatureFeatureMedia)
+	}
+	if !h.gate.require(c, evt.ID, features...) {
 		return
 	}
 	if err = h.media.UpdateStatuses(c.Request.Context(), evt.ID, ids, req.Status); err != nil {

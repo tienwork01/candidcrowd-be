@@ -34,8 +34,18 @@ func newInMemoryEventRepo() *inMemoryEventRepo {
 func (r *inMemoryEventRepo) Create(ctx context.Context, event *Event) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if event.ClientRequestID != nil {
+		for _, existing := range r.events {
+			if existing.HostID == event.HostID && existing.ClientRequestID != nil && *existing.ClientRequestID == *event.ClientRequestID {
+				return ErrDuplicateRequest
+			}
+		}
+	}
 	if event.ID == uuid.Nil {
 		event.ID = uuid.New()
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
 	}
 	r.events[event.ID] = *event
 	return nil
@@ -212,6 +222,43 @@ func (r *inMemoryEventRepo) DeleteOwned(_ context.Context, id, hostID uuid.UUID)
 	return nil
 }
 
+func (r *inMemoryEventRepo) CloseOwned(_ context.Context, id, hostID uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.events[id]
+	if !ok || e.HostID != hostID || e.Status != StatusActive {
+		return ErrNotFound
+	}
+	e.Status = StatusClosed
+	e.UpdatedAt = time.Now().UTC()
+	r.events[id] = e
+	return nil
+}
+
+func (r *inMemoryEventRepo) CountActiveTrialsByHost(_ context.Context, hostID uuid.UUID) (int64, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var count int64
+	for _, e := range r.events {
+		if e.HostID == hostID && e.Status == StatusActive && e.TrialStartedAt != nil && e.TrialEndedAt == nil {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (r *inMemoryEventRepo) CountTrialsSince(_ context.Context, hostID uuid.UUID, since time.Time) (int64, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var count int64
+	for _, e := range r.events {
+		if e.HostID == hostID && e.TrialStartedAt != nil && (e.TrialStartedAt.After(since) || e.TrialStartedAt.Equal(since)) {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func TestEventCreateAndIsolation(t *testing.T) {
 	repo := newInMemoryEventRepo()
 	svc := NewService(repo, 100*1024*1024)
@@ -231,7 +278,6 @@ func TestEventCreateAndIsolation(t *testing.T) {
 	require.Equal(t, "Host 1 Wedding", e1.Name)
 	require.Equal(t, StatusActive, e1.Status)
 	require.NotEmpty(t, e1.Slug)
-	require.Equal(t, "social", e1.EventMode)
 	require.JSONEq(t, "{}", string(e1.SetupChecklist))
 	require.True(t, e1.CandidCameraEnabled)
 
@@ -374,6 +420,7 @@ func TestEventHandlerCreateGate(t *testing.T) {
 	res3 := httptest.NewRecorder()
 	r2.ServeHTTP(res3, req3)
 	require.Equal(t, http.StatusCreated, res3.Code)
+	require.NotContains(t, res3.Body.String(), `"event_mode"`)
 
 	var created Event
 	require.NoError(t, json.Unmarshal(res3.Body.Bytes(), &created))
@@ -537,6 +584,7 @@ func TestEventHandlerListWithQuery(t *testing.T) {
 	r.ServeHTTP(res, req)
 
 	require.Equal(t, http.StatusOK, res.Code)
+	require.NotContains(t, res.Body.String(), `"event_mode"`)
 
 	var resp struct {
 		Data       []Event    `json:"data"`
@@ -642,6 +690,64 @@ func TestService_Update_GuestTheme(t *testing.T) {
 	require.JSONEq(t, `{"fgColor":"#181e17","dotType":"rounded"}`, string(*updated.QRConfig))
 }
 
+func TestEventActiveLimit(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	svc := NewService(repo, 100*1024*1024).WithLimits(1, 10, true)
+	ctx := context.Background()
+	hostID := uuid.New()
+
+	// 1. First active event succeeds
+	first, err := svc.Create(ctx, hostID, CreateInput{Name: "Wedding 1"})
+	require.NoError(t, err)
+	require.Equal(t, StatusActive, first.Status)
+
+	// 2. Second event creation while first is active fails
+	_, err = svc.Create(ctx, hostID, CreateInput{Name: "Wedding 2"})
+	require.ErrorIs(t, err, ErrActiveEventLimitReached)
+
+	// 3. Different host can create an active event without conflict
+	otherHostID := uuid.New()
+	other, err := svc.Create(ctx, otherHostID, CreateInput{Name: "Other Host Party"})
+	require.NoError(t, err)
+	require.Equal(t, StatusActive, other.Status)
+
+	// 4. Close first event
+	err = svc.Close(ctx, first.ID, hostID)
+	require.NoError(t, err)
+
+	// 5. Host can now create a new event since first is closed
+	second, err := svc.Create(ctx, hostID, CreateInput{Name: "Wedding 2"})
+	require.NoError(t, err)
+	require.Equal(t, StatusActive, second.Status)
+}
+
+func TestEventTrialRollingWindowLimit(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	simulatedTime := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
+	svc := NewService(repo, 100*1024*1024).WithLimits(10, 2, true)
+	svc.now = func() time.Time { return simulatedTime }
+	ctx := context.Background()
+	hostID := uuid.New()
+
+	// Closed/deleted trials still count against the rolling allowance.
+	for i := 1; i <= 2; i++ {
+		evt, err := svc.Create(ctx, hostID, CreateInput{Name: fmt.Sprintf("Event %d", i)})
+		require.NoError(t, err)
+		err = svc.Close(ctx, evt.ID, hostID)
+		require.NoError(t, err)
+	}
+
+	_, err := svc.Create(ctx, hostID, CreateInput{Name: "Event 3"})
+	require.ErrorIs(t, err, ErrTrialWindowLimitReached)
+
+	simulatedTime = simulatedTime.Add(31 * 24 * time.Hour)
+
+	// Creation succeeds after the rolling 30-day window passes.
+	fifth, err := svc.Create(ctx, hostID, CreateInput{Name: "Event 5"})
+	require.NoError(t, err)
+	require.Equal(t, StatusActive, fifth.Status)
+}
+
 func TestService_Update_RejectsInvalidQRConfig(t *testing.T) {
 	repo := newInMemoryEventRepo()
 	svc := NewService(repo, 100*1024*1024)
@@ -652,4 +758,119 @@ func TestService_Update_RejectsInvalidQRConfig(t *testing.T) {
 	invalid := datatypes.JSON([]byte(`{"fgColor":"blue"}`))
 	_, err = svc.Update(context.Background(), created.ID, hostID, UpdateInput{QRConfig: &invalid})
 	require.ErrorContains(t, err, "fgColor")
+}
+
+func (r *inMemoryEventRepo) GetByClientRequest(ctx context.Context, hostID, clientRequestID uuid.UUID) (Event, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.events {
+		if e.HostID == hostID && e.ClientRequestID != nil && *e.ClientRequestID == clientRequestID {
+			return e, nil
+		}
+	}
+	return Event{}, ErrNotFound
+}
+
+func TestCreateReplaysDuplicateClientRequest(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	svc := NewService(repo, 1<<30)
+	hostID, requestID := uuid.New(), uuid.New()
+
+	first, err := svc.Create(context.Background(), hostID, CreateInput{Name: "Party", ClientRequestID: &requestID})
+	require.NoError(t, err)
+	again, err := svc.Create(context.Background(), hostID, CreateInput{Name: "Party", ClientRequestID: &requestID})
+	require.NoError(t, err)
+	require.Equal(t, first.ID, again.ID, "a retried create returns the event the first attempt made")
+	require.Len(t, repo.events, 1)
+
+	otherHost, err := svc.Create(context.Background(), uuid.New(), CreateInput{Name: "Party", ClientRequestID: &requestID})
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, otherHost.ID, "request ids are scoped to the host")
+}
+
+func TestEventHandler_CreationLimitsAndClose(t *testing.T) {
+	repo := newInMemoryEventRepo()
+	eventSvc := NewService(repo, 100*1024*1024).WithLimits(1, 2, true)
+	profileRepo := newTestProfileRepo()
+	profileSvc := profile.NewService(profileRepo, "2026-01", "2026-01")
+	handler := NewHandler(eventSvc, profileSvc)
+
+	gin.SetMode(gin.TestMode)
+	hostID := "lim_host_" + uuid.NewString()
+	identity := auth.Identity{
+		BetterAuthUserID: hostID,
+		Email:            hostID + "@example.com",
+		Name:             "Limit Host",
+		EmailVerified:    true,
+	}
+
+	ctx := context.Background()
+	_, err := profileSvc.Accept(ctx, identity, "2026-01", "2026-01")
+	require.NoError(t, err)
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(auth.IdentityKey, identity)
+		c.Next()
+	})
+	r.POST("/events", handler.Create)
+	r.POST("/events/:id/close", handler.Close)
+
+	// 1. First event created successfully (201)
+	body1, _ := json.Marshal(map[string]any{"name": "Active Event 1"})
+	req1 := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body1))
+	req1.Header.Set("Content-Type", "application/json")
+	res1 := httptest.NewRecorder()
+	r.ServeHTTP(res1, req1)
+	require.Equal(t, http.StatusCreated, res1.Code)
+
+	var created1 Event
+	require.NoError(t, json.Unmarshal(res1.Body.Bytes(), &created1))
+	require.Equal(t, "Active Event 1", created1.Name)
+	require.Equal(t, StatusActive, created1.Status)
+
+	// 2. Second event while first is active returns 409 Conflict with active_event_limit_reached
+	body2, _ := json.Marshal(map[string]any{"name": "Active Event 2"})
+	req2 := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	res2 := httptest.NewRecorder()
+	r.ServeHTTP(res2, req2)
+	require.Equal(t, http.StatusConflict, res2.Code)
+	require.Contains(t, res2.Body.String(), "active_event_limit_reached")
+
+	// 3. Close first event returns 200 OK with status closed
+	reqClose := httptest.NewRequest(http.MethodPost, "/events/"+created1.ID.String()+"/close", nil)
+	resClose := httptest.NewRecorder()
+	r.ServeHTTP(resClose, reqClose)
+	require.Equal(t, http.StatusOK, resClose.Code)
+
+	var closed1 Event
+	require.NoError(t, json.Unmarshal(resClose.Body.Bytes(), &closed1))
+	require.Equal(t, StatusClosed, closed1.Status)
+
+	// 4. Now second event creation succeeds (201) because active slot is freed
+	req3 := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body2))
+	req3.Header.Set("Content-Type", "application/json")
+	res3 := httptest.NewRecorder()
+	r.ServeHTTP(res3, req3)
+	require.Equal(t, http.StatusCreated, res3.Code)
+
+	var created2 Event
+	require.NoError(t, json.Unmarshal(res3.Body.Bytes(), &created2))
+	require.Equal(t, "Active Event 2", created2.Name)
+
+	// Close second event too
+	reqClose2 := httptest.NewRequest(http.MethodPost, "/events/"+created2.ID.String()+"/close", nil)
+	resClose2 := httptest.NewRecorder()
+	r.ServeHTTP(resClose2, reqClose2)
+	require.Equal(t, http.StatusOK, resClose2.Code)
+
+	// 5. Rolling trial limit (configured to 2) is reached.
+	body3, _ := json.Marshal(map[string]any{"name": "Active Event 3"})
+	req4 := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body3))
+	req4.Header.Set("Content-Type", "application/json")
+	res4 := httptest.NewRecorder()
+	r.ServeHTTP(res4, req4)
+	require.Equal(t, http.StatusTooManyRequests, res4.Code)
+	require.Contains(t, res4.Body.String(), "trial_window_limit_reached")
 }

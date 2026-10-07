@@ -8,9 +8,10 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
-	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -26,6 +27,13 @@ type QRLogoHandler struct {
 	profiles *profile.Service
 	storage  media.Storage
 	expiry   time.Duration
+	gate     planGate
+}
+
+// UsePlans makes the handler respect each event's plan.
+func (h *QRLogoHandler) UsePlans(plans *entitlement.Service) *QRLogoHandler {
+	h.gate = planGate{plans: plans}
+	return h
 }
 
 func NewQRLogoHandler(events *event.Service, profiles *profile.Service, storage media.Storage, expiry time.Duration) *QRLogoHandler {
@@ -88,31 +96,7 @@ func qrLogoURL(slug string, assetID uuid.UUID, mime string) string {
 }
 
 func (h *QRLogoHandler) ownedEvent(c *gin.Context) (event.Event, bool) {
-	id, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
-		return event.Event{}, false
-	}
-	identity, err := auth.Get(c)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	evt, err := h.events.GetOwned(c.Request.Context(), id, hostID)
-	if errors.Is(err, event.ErrNotFound) {
-		apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
-		return event.Event{}, false
-	}
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	return evt, true
+	return resolveOwnedEvent(c, h.events, h.profiles)
 }
 
 func qrLogoKey(eventID, assetID uuid.UUID, mime string) (string, error) {
@@ -125,7 +109,7 @@ func qrLogoKey(eventID, assetID uuid.UUID, mime string) (string, error) {
 
 func (h *QRLogoHandler) CreateUploadTarget(c *gin.Context) {
 	evt, ok := h.ownedEvent(c)
-	if !ok {
+	if !ok || !h.gate.require(c, evt.ID, catalog.FeatureFullCustomization) {
 		return
 	}
 	var req qrLogoUploadRequest
@@ -153,7 +137,7 @@ func (h *QRLogoHandler) CreateUploadTarget(c *gin.Context) {
 // for the large guest media flow.
 func (h *QRLogoHandler) Upload(c *gin.Context) {
 	evt, ok := h.ownedEvent(c)
-	if !ok {
+	if !ok || !h.gate.require(c, evt.ID, catalog.FeatureFullCustomization) {
 		return
 	}
 	// Leave room for multipart boundaries and headers in addition to the file.
@@ -184,7 +168,7 @@ func (h *QRLogoHandler) Upload(c *gin.Context) {
 
 func (h *QRLogoHandler) Complete(c *gin.Context) {
 	evt, ok := h.ownedEvent(c)
-	if !ok {
+	if !ok || !h.gate.require(c, evt.ID, catalog.FeatureFullCustomization) {
 		return
 	}
 	assetID, err := uuid.Parse(c.Param("assetId"))

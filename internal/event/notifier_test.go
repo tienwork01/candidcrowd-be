@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -15,6 +16,9 @@ type recordingEventRepo struct {
 }
 
 func (r *recordingEventRepo) Create(context.Context, *Event) error { return nil }
+func (r *recordingEventRepo) GetByClientRequest(context.Context, uuid.UUID, uuid.UUID) (Event, error) {
+	return Event{}, ErrNotFound
+}
 func (r *recordingEventRepo) ListByHost(context.Context, uuid.UUID, ListFilter) ([]Event, int64, error) {
 	return nil, 0, nil
 }
@@ -31,6 +35,13 @@ func (r *recordingEventRepo) UpdateOwned(context.Context, uuid.UUID, uuid.UUID, 
 	return r.updated, nil
 }
 func (r *recordingEventRepo) DeleteOwned(context.Context, uuid.UUID, uuid.UUID) error { return nil }
+func (r *recordingEventRepo) CloseOwned(context.Context, uuid.UUID, uuid.UUID) error  { return nil }
+func (r *recordingEventRepo) CountActiveTrialsByHost(context.Context, uuid.UUID) (int64, error) {
+	return 0, nil
+}
+func (r *recordingEventRepo) CountTrialsSince(context.Context, uuid.UUID, time.Time) (int64, error) {
+	return 0, nil
+}
 
 type recordingEventNotifier struct {
 	mu      sync.Mutex
@@ -51,7 +62,7 @@ func (n *recordingEventNotifier) all() []Change {
 
 func TestUpdateAnnouncesSettingsALivePageReactsTo(t *testing.T) {
 	eventID := uuid.New()
-	repo := &recordingEventRepo{updated: Event{ID: eventID, GalleryEnabled: false, EventMode: "silent", Status: StatusActive}}
+	repo := &recordingEventRepo{updated: Event{ID: eventID, GalleryEnabled: false, Status: StatusActive}}
 	notifier := &recordingEventNotifier{}
 	service := NewService(repo, 1<<30, notifier)
 
@@ -67,7 +78,7 @@ func TestUpdateAnnouncesSettingsALivePageReactsTo(t *testing.T) {
 
 func TestUpdateStaysQuietForSettingsNoBrowserRedraws(t *testing.T) {
 	eventID := uuid.New()
-	repo := &recordingEventRepo{updated: Event{ID: eventID, GalleryEnabled: true, EventMode: "social"}}
+	repo := &recordingEventRepo{updated: Event{ID: eventID, GalleryEnabled: true}}
 	notifier := &recordingEventNotifier{}
 	service := NewService(repo, 1<<30, notifier)
 
@@ -84,8 +95,8 @@ func TestFailedUpdateIsNotAnnounced(t *testing.T) {
 	notifier := &recordingEventNotifier{}
 	service := NewService(repo, 1<<30, notifier)
 
-	mode := "party"
-	_, err := service.Update(context.Background(), uuid.New(), uuid.New(), UpdateInput{EventMode: &mode})
+	disabled := false
+	_, err := service.Update(context.Background(), uuid.New(), uuid.New(), UpdateInput{GalleryEnabled: &disabled})
 	require.ErrorIs(t, err, ErrNotFound)
 	require.Empty(t, notifier.all())
 }

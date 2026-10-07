@@ -4,10 +4,13 @@ package googledrive
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net/http"
 
 	"golang.org/x/oauth2"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -36,8 +39,15 @@ func (c *Client) Upload(ctx context.Context, name, mimeType string, body io.Read
 	return created.Id, nil
 }
 
+// Delete removes a file. A file that is already gone counts as deleted, so a
+// cleanup that is retried after a partial failure does not get stuck on it.
 func (c *Client) Delete(ctx context.Context, fileID string) error {
-	return c.service.Files.Delete(fileID).Context(ctx).Do()
+	err := c.service.Files.Delete(fileID).Context(ctx).Do()
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 func (c *Client) OpenRead(ctx context.Context, fileID string) (io.ReadCloser, error) {

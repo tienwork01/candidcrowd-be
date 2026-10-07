@@ -54,6 +54,49 @@ type Config struct {
 	StaleUploadAge      time.Duration
 	StaleUploadSchedule string
 
+	// Event plans rollout. These switch plan surfaces on, they do not grant
+	// anything: what an event may do always comes from its grant.
+	PlansCatalogEnabled         bool
+	PlansPricingUIEnabled       bool
+	ManualPlanActivationEnabled bool
+	// While off, uploads are capped by EVENT_MAX_MEDIA_BYTES as before rather
+	// than by each event's plan.
+	EntitlementEnforcementEnabled bool
+	// Retention permanently deletes media once a plan's storage period and
+	// the grace period after it have passed. Off, the daily job only logs
+	// which events are due.
+	RetentionEnforcementEnabled bool
+	RetentionGrace              time.Duration
+	RetentionSchedule           string
+	RetentionBatch              int
+
+	// Event creation limits
+	RateLimitEventCreateIP     int
+	RateLimitEventCreateHost   int
+	MaxActiveEventsPerHost     int
+	MaxTrialEventsPer30Days    int
+	EventCreationLimitsEnabled bool
+
+	// Billing. While off, checkout routes are not mounted and Paddle secrets
+	// are not required.
+	BillingEnabled           bool
+	BillingProvider          string
+	BillingCurrency          string
+	BillingSuccessURL        string
+	BillingCancelURL         string
+	BillingReconcileSchedule string
+	BillingReconcileBatch    int
+
+	// Paddle. Required only when billing is enabled with provider=paddle.
+	PaddleEnvironment   string
+	PaddleAPIKey        string
+	PaddleWebhookSecret string
+	// PaddleCheckoutURL is the page that can complete a transaction. Paddle
+	// refuses to create one unless this is sent or the account has a default
+	// payment link, so a deployment that sets it does not depend on dashboard
+	// configuration.
+	PaddleCheckoutURL string
+
 	// Background workers. Enabled by default so an existing single-process
 	// deployment is unchanged; set RUN_WORKER=false on request-serving replicas
 	// once a dedicated worker replica is deployed.
@@ -169,6 +212,34 @@ func Load() (Config, error) {
 		StaleUploadAge:      parseDuration("UPLOAD_STALE_AGE", "24h"),
 		StaleUploadSchedule: str("UPLOAD_STALE_CLEANUP_SCHEDULE", "*/15 * * * *"),
 
+		PlansCatalogEnabled:           parseBool("PLANS_CATALOG_ENABLED", true),
+		PlansPricingUIEnabled:         parseBool("PLANS_PRICING_UI_ENABLED", false),
+		ManualPlanActivationEnabled:   parseBool("MANUAL_PLAN_ACTIVATION_ENABLED", false),
+		EntitlementEnforcementEnabled: parseBool("ENTITLEMENT_ENFORCEMENT_ENABLED", false),
+		RetentionEnforcementEnabled:   parseBool("RETENTION_ENFORCEMENT_ENABLED", false),
+		RetentionGrace:                parseDuration("RETENTION_GRACE", "720h"),
+		RetentionSchedule:             str("RETENTION_SCHEDULE", "30 3 * * *"),
+		RetentionBatch:                parseInt("RETENTION_BATCH", 25),
+
+		RateLimitEventCreateIP:     parseInt("RATE_LIMIT_EVENT_CREATE_IP", 10),
+		RateLimitEventCreateHost:   parseInt("RATE_LIMIT_EVENT_CREATE_HOST", 2),
+		MaxActiveEventsPerHost:     parseInt("MAX_ACTIVE_EVENTS_PER_HOST", 1),
+		MaxTrialEventsPer30Days:    parseInt("MAX_TRIAL_EVENTS_PER_30_DAYS", 2),
+		EventCreationLimitsEnabled: parseBool("EVENT_CREATION_LIMITS_ENABLED", true),
+
+		BillingEnabled:           parseBool("BILLING_ENABLED", false),
+		BillingProvider:          str("BILLING_PROVIDER", "paddle"),
+		BillingCurrency:          strings.ToUpper(str("BILLING_CURRENCY", "USD")),
+		BillingSuccessURL:        os.Getenv("BILLING_SUCCESS_URL"),
+		BillingCancelURL:         os.Getenv("BILLING_CANCEL_URL"),
+		BillingReconcileSchedule: str("BILLING_RECONCILE_SCHEDULE", "*/5 * * * *"),
+		BillingReconcileBatch:    parseInt("BILLING_RECONCILE_BATCH", 50),
+
+		PaddleEnvironment:   str("PADDLE_ENVIRONMENT", "sandbox"),
+		PaddleAPIKey:        os.Getenv("PADDLE_API_KEY"),
+		PaddleWebhookSecret: os.Getenv("PADDLE_WEBHOOK_SECRET"),
+		PaddleCheckoutURL:   os.Getenv("PADDLE_CHECKOUT_URL"),
+
 		RunWorker:              parseBool("RUN_WORKER", true),
 		MediaWorkerConcurrency: parseInt("MEDIA_WORKER_CONCURRENCY", 2),
 		MediaWorkerIdle:        parseDuration("MEDIA_WORKER_IDLE", "5s"),
@@ -225,6 +296,24 @@ func Load() (Config, error) {
 			if required.value == "" {
 				missing = append(missing, required.name)
 			}
+		}
+	}
+
+	if c.BillingEnabled && c.BillingProvider != "paddle" {
+		errs = append(errs, fmt.Sprintf("BILLING_PROVIDER %q is not configured", c.BillingProvider))
+	}
+	if c.BillingEnabled && c.BillingProvider == "paddle" {
+		if c.PaddleAPIKey == "" {
+			missing = append(missing, "PADDLE_API_KEY")
+		}
+		if c.PaddleWebhookSecret == "" {
+			missing = append(missing, "PADDLE_WEBHOOK_SECRET")
+		}
+		if c.BillingSuccessURL == "" {
+			missing = append(missing, "BILLING_SUCCESS_URL")
+		}
+		if c.BillingCancelURL == "" {
+			missing = append(missing, "BILLING_CANCEL_URL")
 		}
 	}
 

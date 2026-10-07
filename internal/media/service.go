@@ -11,7 +11,10 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"io"
+	"math"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +27,17 @@ import (
 type ObjectInfo struct {
 	Size        int64
 	ContentType string
+}
+
+// PresentationMetadata is stable information extracted from the original
+// asset. It lets presentation clients preserve aspect ratio and choose a safe
+// video transition cue without decoding or analysing media in their render
+// loop.
+type PresentationMetadata struct {
+	Width                *int
+	Height               *int
+	DurationSeconds      *float64
+	TransitionCueSeconds *float64
 }
 
 type Storage interface {
@@ -94,6 +108,11 @@ type UploadScope struct {
 	GuestSessionID uuid.UUID
 	Accepting      bool
 	MaxEventBytes  int64
+	// EnforceItems applies the plan's item limits to new reservations.
+	EnforceItems bool
+	// UploadClosed rejects new reservations because the event's upload window
+	// has ended. Uploads already reserved may still complete.
+	UploadClosed bool
 }
 
 func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in CreateInput) (UploadTarget, error) {
@@ -114,6 +133,9 @@ func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in Create
 		return UploadTarget{}, existingErr
 	}
 	if errors.Is(existingErr, ErrNotFound) {
+		if scope.UploadClosed {
+			return UploadTarget{}, ErrUploadClosed
+		}
 		duplicate, err := s.repo.HasReadyChecksum(ctx, scope.EventID, in.ChecksumSHA256)
 		if err != nil {
 			return UploadTarget{}, err
@@ -131,7 +153,7 @@ func (s *Service) CreateUpload(ctx context.Context, scope UploadScope, in Create
 		clientID := in.ClientUploadID
 		m = Media{ID: uuid.New(), EventID: scope.EventID, GuestSessionID: scope.GuestSessionID, OriginalFilename: filepath.Base(in.Filename), MIMEType: in.MIMEType, GuestName: optionalText(in.GuestName), Caption: optionalText(in.Caption), ExpectedSize: in.Size, ChecksumSHA256: strings.ToLower(in.ChecksumSHA256), ClientUploadID: &clientID, Status: StatusPending, LastActivityAt: time.Now()}
 		m.ObjectKey = fmt.Sprintf("events/%s/media/%s/original%s", scope.EventID, m.ID, extension(in.MIMEType))
-		err = s.repo.ReserveUpload(ctx, m, scope.MaxEventBytes)
+		err = s.repo.ReserveUpload(ctx, m, ReserveLimits{MaxEventBytes: scope.MaxEventBytes, EnforceItems: scope.EnforceItems})
 		if err != nil {
 			// A concurrent duplicate request may have won the unique client ID race.
 			if existing, findErr := s.repo.FindByClientUpload(ctx, scope.EventID, scope.GuestSessionID, in.ClientUploadID); findErr == nil {
@@ -278,7 +300,7 @@ func thumbnailKey(m Media) string {
 // larger keeps the original as its gallery fallback.
 const maxThumbnailPixels = 50_000_000
 
-// GenerateThumbnail renders the gallery-sized variant of one image. It is the
+// GenerateThumbnail renders the gallery-sized variant of one image or video. It is the
 // unit of work behind a mediajob, so its result decides whether the job is
 // retried: a returned error means "try again later", and nil means the record
 // needs nothing further.
@@ -293,10 +315,21 @@ func (s *Service) GenerateThumbnail(ctx context.Context, mediaID uuid.UUID) erro
 		}
 		return err
 	}
-	if m.ThumbnailReady || !strings.HasPrefix(m.MIMEType, "image/") {
+	if m.ThumbnailReady && hasPresentationMetadata(m) {
 		return nil
 	}
 
+	if strings.HasPrefix(m.MIMEType, "image/") {
+		return s.generateImageThumbnail(ctx, m)
+	}
+	if strings.HasPrefix(m.MIMEType, "video/") {
+		return s.generateVideoThumbnail(ctx, m)
+	}
+
+	return nil
+}
+
+func (s *Service) generateImageThumbnail(ctx context.Context, m Media) error {
 	body, _, err := s.storage.OpenRead(ctx, m.ObjectKey)
 	if err != nil {
 		// The object may still be replicating, or storage may be briefly
@@ -315,8 +348,12 @@ func (s *Service) GenerateThumbnail(ctx context.Context, mediaID uuid.UUID) erro
 		// would burn five attempts to reach the same answer.
 		return nil
 	}
-	if config.Width < 1 || config.Height < 1 || config.Width*config.Height > maxThumbnailPixels {
+	metadata := PresentationMetadata{Width: intPointer(config.Width), Height: intPointer(config.Height)}
+	if config.Width < 1 || config.Height < 1 {
 		return nil
+	}
+	if m.ThumbnailReady || config.Width*config.Height > maxThumbnailPixels {
+		return s.updateProcessingResult(ctx, m, m.ThumbnailReady, metadata)
 	}
 
 	source, _, err := image.Decode(io.MultiReader(bytes.NewReader(header.Bytes()), body))
@@ -345,16 +382,207 @@ func (s *Service) GenerateThumbnail(ctx context.Context, mediaID uuid.UUID) erro
 	if err := s.storage.Put(ctx, thumbnailKey(m), "image/jpeg", &encoded); err != nil {
 		return fmt.Errorf("store thumbnail: %w", err)
 	}
-	if err := s.repo.MarkThumbnailReady(ctx, m.EventID, m.ID); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			// Moderated or deleted while this ran. The object is harmless.
-			return nil
-		}
-		return fmt.Errorf("mark thumbnail ready: %w", err)
+	if err := s.updateProcessingResult(ctx, m, true, metadata); err != nil {
+		return err
 	}
 	s.notify(ctx, Change{Kind: ChangeThumbnail, EventID: m.EventID, IDs: []uuid.UUID{m.ID}})
 	return nil
 }
+
+func (s *Service) generateVideoThumbnail(ctx context.Context, m Media) error {
+	metadata := s.probeVideoMetadata(ctx, m)
+	if m.ThumbnailReady {
+		return s.updateProcessingResult(ctx, m, true, metadata)
+	}
+
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		// ffmpeg is not available on this host or container environment.
+		// Persist any metadata ffprobe could still read, then skip extraction
+		// gracefully without failing the job.
+		return s.updateProcessingResult(ctx, m, false, metadata)
+	}
+
+	// Presign a GET URL for the video so FFmpeg can fetch keyframes directly
+	// via HTTP range requests without downloading the entire video to server disk/memory.
+	downloadURL, err := s.storage.PresignGet(ctx, m.ObjectKey, 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("presign video for thumbnail: %w", err)
+	}
+
+	// Bound extraction time to 25 seconds to protect worker concurrency slots.
+	ffmpegCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	// -ss 00:00:01.000: seek to 1 second (near first keyframe)
+	// -noaccurate_seek: fast seek using keyframes without decoding from 0:00
+	// -i: input presigned URL
+	// -vframes 1: extract single frame
+	// -vf "scale='min(720,iw)':-2": scale to max 720 width while preserving aspect ratio (divisible by 2)
+	// -q:v 2: high quality JPEG
+	// -f image2 -: output JPEG to stdout pipe
+	cmd := exec.CommandContext(ffmpegCtx, ffmpegPath,
+		"-ss", "00:00:01.000",
+		"-noaccurate_seek",
+		"-i", downloadURL,
+		"-vframes", "1",
+		"-vf", "scale='min(720,iw)':-2",
+		"-q:v", "2",
+		"-f", "image2",
+		"-",
+	)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil || stdout.Len() == 0 {
+		// If video is shorter than 1s or seek failed, retry at 00:00:00.000:
+		stdout.Reset()
+		stderr.Reset()
+		cmdRetry := exec.CommandContext(ffmpegCtx, ffmpegPath,
+			"-ss", "00:00:00.000",
+			"-i", downloadURL,
+			"-vframes", "1",
+			"-vf", "scale='min(720,iw)':-2",
+			"-q:v", "2",
+			"-f", "image2",
+			"-",
+		)
+		cmdRetry.Stdout = &stdout
+		cmdRetry.Stderr = &stderr
+		if errRetry := cmdRetry.Run(); errRetry != nil || stdout.Len() == 0 {
+			// Corrupt or unsupported video container format. Retrying won't help,
+			// so return nil to retire the job.
+			return nil
+		}
+	}
+
+	if stdout.Len() == 0 {
+		return nil
+	}
+
+	if err := s.storage.Put(ctx, thumbnailKey(m), "image/jpeg", &stdout); err != nil {
+		return fmt.Errorf("store video thumbnail: %w", err)
+	}
+
+	if err := s.updateProcessingResult(ctx, m, true, metadata); err != nil {
+		return err
+	}
+
+	s.notify(ctx, Change{Kind: ChangeThumbnail, EventID: m.EventID, IDs: []uuid.UUID{m.ID}})
+	return nil
+}
+
+func (s *Service) updateProcessingResult(ctx context.Context, m Media, thumbnailReady bool, metadata PresentationMetadata) error {
+	if err := s.repo.UpdateProcessingResult(ctx, m.EventID, m.ID, thumbnailReady, metadata); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// Moderated or deleted while this ran. Any generated object is
+			// harmless and normal cleanup will remove it with the media.
+			return nil
+		}
+		return fmt.Errorf("persist media processing result: %w", err)
+	}
+	return nil
+}
+
+func hasPresentationMetadata(m Media) bool {
+	if m.Width == nil || m.Height == nil {
+		return false
+	}
+	if strings.HasPrefix(m.MIMEType, "video/") {
+		return m.DurationSeconds != nil && m.TransitionCueSeconds != nil
+	}
+	return true
+}
+
+type videoProbeOutput struct {
+	Streams []struct {
+		Width    int    `json:"width"`
+		Height   int    `json:"height"`
+		Duration string `json:"duration"`
+		Tags     struct {
+			Rotate string `json:"rotate"`
+		} `json:"tags"`
+		SideDataList []struct {
+			Rotation float64 `json:"rotation"`
+		} `json:"side_data_list"`
+	} `json:"streams"`
+	Format struct {
+		Duration string `json:"duration"`
+	} `json:"format"`
+}
+
+func (s *Service) probeVideoMetadata(ctx context.Context, m Media) PresentationMetadata {
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return PresentationMetadata{}
+	}
+	downloadURL, err := s.storage.PresignGet(ctx, m.ObjectKey, 5*time.Minute)
+	if err != nil {
+		return PresentationMetadata{}
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(probeCtx, ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height,duration:stream_tags=rotate:stream_side_data=rotation:format=duration",
+		"-of", "json",
+		downloadURL,
+	).Output()
+	if err != nil {
+		return PresentationMetadata{}
+	}
+	return parseVideoProbe(output)
+}
+
+func parseVideoProbe(output []byte) PresentationMetadata {
+	var probe videoProbeOutput
+	if json.Unmarshal(output, &probe) != nil || len(probe.Streams) == 0 {
+		return PresentationMetadata{}
+	}
+	stream := probe.Streams[0]
+	width, height := stream.Width, stream.Height
+	rotation, _ := strconv.ParseFloat(stream.Tags.Rotate, 64)
+	if len(stream.SideDataList) > 0 {
+		rotation = stream.SideDataList[0].Rotation
+	}
+	quarterTurns := int(math.Round(math.Abs(rotation)/90)) % 2
+	if quarterTurns == 1 {
+		width, height = height, width
+	}
+	metadata := PresentationMetadata{}
+	if width > 0 && height > 0 {
+		metadata.Width = intPointer(width)
+		metadata.Height = intPointer(height)
+	}
+	duration, err := strconv.ParseFloat(stream.Duration, 64)
+	if err != nil || duration <= 0 {
+		duration, _ = strconv.ParseFloat(probe.Format.Duration, 64)
+	}
+	if duration > 0 && !math.IsNaN(duration) && !math.IsInf(duration, 0) {
+		duration = math.Round(duration*1000) / 1000
+		metadata.DurationSeconds = floatPointer(duration)
+		metadata.TransitionCueSeconds = transitionCueForDuration(duration)
+	}
+	return metadata
+}
+
+func transitionCueForDuration(duration float64) *float64 {
+	if duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+		return nil
+	}
+	if duration <= 1 {
+		return floatPointer(math.Round(duration*500) / 1000)
+	}
+	margin := math.Min(1.5, math.Max(0.35, duration*0.12))
+	cue := math.Max(margin, math.Min(duration-margin, duration*0.42))
+	cue = math.Round(cue*1000) / 1000
+	return floatPointer(cue)
+}
+
+func intPointer(value int) *int           { return &value }
+func floatPointer(value float64) *float64 { return &value }
 
 // ExpireStale removes abandoned reservations. A later retry always creates or
 // reuses a client-idempotent upload record, so stale rows must not consume an
@@ -597,20 +825,25 @@ func (s *Service) ListGallery(ctx context.Context, eventID uuid.UUID, filter Gal
 func newPublicView(record Media, urlFor func(uuid.UUID) string) PublicView {
 	route := urlFor(record.ID)
 	return PublicView{
-		ID:             record.ID,
-		URL:            route,
-		MIMEType:       record.MIMEType,
-		CreatedAt:      record.CreatedAt,
-		IsVideo:        strings.HasPrefix(record.MIMEType, "video/"),
-		HasEventFrame:  strings.HasPrefix(record.OriginalFilename, "candid_"),
-		ThumbnailReady: record.ThumbnailReady,
-		Status:         record.Status,
-		GuestName:      record.GuestName,
-		Caption:        record.Caption,
-		objectKey:      record.ObjectKey,
-		thumbnailKey:   thumbnailKey(record),
-		routeURL:       route,
-		sourceArchived: record.SourceArchived(),
+		ID:                   record.ID,
+		URL:                  route,
+		MIMEType:             record.MIMEType,
+		OriginalFilename:     record.OriginalFilename,
+		CreatedAt:            record.CreatedAt,
+		IsVideo:              strings.HasPrefix(record.MIMEType, "video/"),
+		HasEventFrame:        strings.HasPrefix(record.OriginalFilename, "candid_"),
+		ThumbnailReady:       record.ThumbnailReady,
+		Status:               record.Status,
+		GuestName:            record.GuestName,
+		Caption:              record.Caption,
+		Width:                record.Width,
+		Height:               record.Height,
+		DurationSeconds:      record.DurationSeconds,
+		TransitionCueSeconds: record.TransitionCueSeconds,
+		objectKey:            record.ObjectKey,
+		thumbnailKey:         thumbnailKey(record),
+		routeURL:             route,
+		sourceArchived:       record.SourceArchived(),
 	}
 }
 
@@ -636,6 +869,19 @@ func (s *Service) SignPage(ctx context.Context, views []PublicView, expiry time.
 				return err
 			}
 			views[i].URL = url
+
+			if ds, ok := s.storage.(interface {
+				PresignDownload(context.Context, string, string, time.Duration) (string, error)
+			}); ok {
+				filename := views[i].OriginalFilename
+				if filename == "" {
+					filename = fmt.Sprintf("candid-media-%s%s", views[i].ID.String()[:8], filepath.Ext(views[i].objectKey))
+				}
+				dlURL, err := ds.PresignDownload(ctx, views[i].objectKey, filename, expiry)
+				if err == nil {
+					views[i].DownloadURL = dlURL
+				}
+			}
 		}
 		if views[i].ThumbnailReady && views[i].thumbnailKey != "" {
 			url, err := s.storage.PresignGet(ctx, views[i].thumbnailKey, expiry)

@@ -13,11 +13,9 @@ import (
 )
 
 // resolveOwnedEvent authorizes the caller against the :id path parameter and
-// answers the request itself when that fails.
-//
-// HostMediaHandler, InsightsHandler and ExportHandler each carry a private
-// copy of this logic. They are left alone here, but new host handlers use this
-// one so the rule has a single place to migrate to.
+// answers the request itself when that fails. Every host handler goes through
+// it, so ownership — and anything later resolved alongside the event, such as
+// its plan — has one rule.
 func resolveOwnedEvent(c *gin.Context, events *event.Service, profiles *profile.Service) (event.Event, bool) {
 	eventID, err := uuid.Parse(c.Param("id"))
 	if err != nil {

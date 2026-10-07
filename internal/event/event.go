@@ -24,7 +24,7 @@ const (
 type Event struct {
 	ID                  uuid.UUID       `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	HostID              uuid.UUID       `gorm:"type:uuid;not null;index" json:"host_id"`
-	ClientRequestID     *uuid.UUID       `gorm:"type:uuid" json:"-"`
+	ClientRequestID     *uuid.UUID      `gorm:"type:uuid" json:"-"`
 	Name                string          `json:"name"`
 	Slug                string          `gorm:"uniqueIndex" json:"slug"`
 	EventDate           *time.Time      `json:"event_date"`
@@ -32,7 +32,6 @@ type Event struct {
 	ExpectedGuestCount  int             `json:"expected_guest_count"`
 	Status              Status          `gorm:"type:event_status" json:"status"`
 	GalleryEnabled      bool            `json:"gallery_enabled"`
-	EventMode           string          `json:"event_mode"`
 	LifecyclePhase      *string         `json:"lifecycle_phase,omitempty"`
 	SetupChecklist      datatypes.JSON  `gorm:"type:jsonb" json:"setup_checklist"`
 	CandidCameraEnabled bool            `json:"candid_camera_enabled"`
@@ -42,9 +41,27 @@ type Event struct {
 	UsedMediaBytes      int64           `json:"used_media_bytes"`
 	// ReservedMediaBytes counts quota taken by uploads that have not completed.
 	// It is released by MarkReady, ExpireStale and Delete.
-	ReservedMediaBytes int64     `json:"reserved_media_bytes"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ReservedMediaBytes int64      `json:"reserved_media_bytes"`
+	TrialStartedAt     *time.Time `json:"-"`
+	TrialEndedAt       *time.Time `json:"-"`
+	// BillingStatus parks an event after a refund or chargeback. It is ops
+	// state, never shown to the host, and nothing in the product reads it to
+	// restrict an event: a reversal must not quietly take a gallery away.
+	// The default tag matters: without it GORM writes the empty Go string on
+	// insert and the column's CHECK rejects every new event.
+	BillingStatus string    `gorm:"column:billing_status;default:ok" json:"-"`
+	Metrics       *Metrics  `gorm:"-" json:"metrics,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type Metrics struct {
+	ScansCount        int64 `json:"scans_count"`
+	VisitorsCount     int64 `json:"visitors_count"`
+	ContributorsCount int64 `json:"contributors_count"`
+	PhotosCount       int64 `json:"photos_count"`
+	VideosCount       int64 `json:"videos_count"`
+	ParticipationRate int   `json:"participation_rate"`
 }
 
 type Pagination struct {

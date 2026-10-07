@@ -27,7 +27,7 @@ type createRequest struct {
 	EventType          string     `json:"event_type" binding:"omitempty,max=80"`
 	EventDate          *time.Time `json:"event_date"`
 	ExpectedGuestCount int        `json:"expected_guest_count" binding:"gte=0"`
-	ClientRequestID string `json:"client_request_id" binding:"omitempty,uuid4"`
+	ClientRequestID    string     `json:"client_request_id" binding:"omitempty,uuid4"`
 }
 
 type updateRequest struct {
@@ -37,7 +37,6 @@ type updateRequest struct {
 	ClearEventDate      bool            `json:"clear_event_date"`
 	ExpectedGuestCount  *int            `json:"expected_guest_count" binding:"omitempty,gte=0"`
 	GalleryEnabled      *bool           `json:"gallery_enabled"`
-	EventMode           *string         `json:"event_mode" binding:"omitempty,max=32"`
 	LifecyclePhase      *string         `json:"lifecycle_phase" binding:"omitempty,max=32"`
 	SetupChecklist      *datatypes.JSON `json:"setup_checklist"`
 	CandidCameraEnabled *bool           `json:"candid_camera_enabled"`
@@ -70,15 +69,30 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	var clientRequestID *uuid.UUID
-	if req.ClientRequestID != "" { parsed, parseErr := uuid.Parse(req.ClientRequestID); if parseErr != nil { apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", "client_request_id must be a UUID")); return }; clientRequestID = &parsed }
+	if req.ClientRequestID != "" {
+		parsed, parseErr := uuid.Parse(req.ClientRequestID)
+		if parseErr != nil {
+			apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_request", "client_request_id must be a UUID"))
+			return
+		}
+		clientRequestID = &parsed
+	}
 	created, err := h.service.Create(c.Request.Context(), view.ID, CreateInput{
 		Name:               req.Name,
 		EventType:          req.EventType,
 		EventDate:          req.EventDate,
 		ExpectedGuestCount: req.ExpectedGuestCount,
-		ClientRequestID: clientRequestID,
+		ClientRequestID:    clientRequestID,
 	})
 	if err != nil {
+		if errors.Is(err, ErrTrialWindowLimitReached) {
+			apierror.Respond(c, apierror.New(http.StatusTooManyRequests, "trial_window_limit_reached", "you have reached the Free Trial limit for the last 30 days"))
+			return
+		}
+		if errors.Is(err, ErrActiveEventLimitReached) {
+			apierror.Respond(c, apierror.New(http.StatusConflict, "active_event_limit_reached", "you already have an active event"))
+			return
+		}
 		apierror.Respond(c, err)
 		return
 	}
@@ -184,7 +198,6 @@ func (h *Handler) Update(c *gin.Context) {
 		ClearEventDate:      req.ClearEventDate,
 		ExpectedGuestCount:  req.ExpectedGuestCount,
 		GalleryEnabled:      req.GalleryEnabled,
-		EventMode:           req.EventMode,
 		LifecyclePhase:      req.LifecyclePhase,
 		SetupChecklist:      req.SetupChecklist,
 		CandidCameraEnabled: req.CandidCameraEnabled,
@@ -195,6 +208,11 @@ func (h *Handler) Update(c *gin.Context) {
 		if errors.Is(err, ErrNotFound) {
 			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
 		} else {
+			var coder apierror.Coder
+			if errors.As(err, &coder) {
+				apierror.Respond(c, err)
+				return
+			}
 			apierror.Respond(c, apierror.New(http.StatusBadRequest, "update_failed", err.Error()))
 		}
 		return
@@ -227,4 +245,31 @@ func (h *Handler) Delete(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func (h *Handler) Close(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
+		return
+	}
+	identity, err := auth.Get(c)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
+	if err != nil {
+		apierror.Respond(c, err)
+		return
+	}
+	if err = h.service.Close(c.Request.Context(), id, hostID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
+		} else {
+			apierror.Respond(c, err)
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "closed"})
 }

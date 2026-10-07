@@ -22,6 +22,22 @@ func (r *gormRepository) Create(ctx context.Context, job Job) (Job, error) {
 	return job, err
 }
 
+func (r *gormRepository) FindActive(ctx context.Context, eventID uuid.UUID) (Job, error) {
+	var job Job
+	err := r.db.WithContext(ctx).
+		Where("event_id = ? AND status IN (?, ?)", eventID, StatusQueued, StatusProcessing).
+		Order("created_at DESC").First(&job).Error
+	return job, mapNotFound(err)
+}
+
+func (r *gormRepository) FindLatest(ctx context.Context, eventID uuid.UUID) (Job, error) {
+	var job Job
+	err := r.db.WithContext(ctx).
+		Where("event_id = ?", eventID).
+		Order("created_at DESC").First(&job).Error
+	return job, mapNotFound(err)
+}
+
 func (r *gormRepository) FindOwned(ctx context.Context, eventID, jobID uuid.UUID) (Job, error) {
 	var job Job
 	err := r.db.WithContext(ctx).Where("id = ? AND event_id = ?", jobID, eventID).First(&job).Error
@@ -47,10 +63,18 @@ func (r *gormRepository) ClaimNext(ctx context.Context) (Job, error) {
 func (r *gormRepository) ListItems(ctx context.Context, eventID uuid.UUID) ([]Item, error) {
 	var items []Item
 	err := r.db.WithContext(ctx).Raw(`
-		SELECT id, object_key, original_filename
-		FROM media
-		WHERE event_id = ? AND status IN ('ready', 'featured', 'hidden')
-		ORDER BY created_at ASC, id ASC`, eventID).Scan(&items).Error
+		SELECT
+			m.id,
+			m.object_key,
+			m.original_filename,
+			m.source_deleted_at,
+			r.location_reference AS drive_location
+		FROM media m
+		LEFT JOIN storage_replicas r ON r.media_id = m.id
+			AND r.provider = 'google_drive'
+			AND r.state = 'verified'
+		WHERE m.event_id = ? AND m.status IN ('ready', 'featured', 'hidden')
+		ORDER BY m.created_at ASC, m.id ASC`, eventID).Scan(&items).Error
 	return items, err
 }
 

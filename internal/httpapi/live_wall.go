@@ -8,10 +8,11 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/livewall"
 	"github.com/candidcrowd/candidcrowd-backend/internal/media"
-	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/candidcrowd/candidcrowd-backend/internal/realtime"
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,13 @@ type LiveWallHandler struct {
 	media    *media.Service
 	sessions *livewall.Service
 	hub      *realtime.Hub
+	gate     planGate
+}
+
+// UsePlans makes the handler respect each event's plan.
+func (h *LiveWallHandler) UsePlans(plans *entitlement.Service) *LiveWallHandler {
+	h.gate = planGate{plans: plans}
+	return h
 }
 
 func NewLiveWallHandler(events *event.Service, profiles *profile.Service, mediaService *media.Service, sessions *livewall.Service, hub *realtime.Hub) *LiveWallHandler {
@@ -31,31 +39,7 @@ func NewLiveWallHandler(events *event.Service, profiles *profile.Service, mediaS
 }
 
 func (h *LiveWallHandler) ownedEvent(c *gin.Context) (event.Event, bool) {
-	eventID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_id", "event id must be a UUID"))
-		return event.Event{}, false
-	}
-	identity, err := auth.Get(c)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	hostID, err := h.profiles.UserID(c.Request.Context(), identity)
-	if err != nil {
-		apierror.Respond(c, err)
-		return event.Event{}, false
-	}
-	evt, err := h.events.GetOwned(c.Request.Context(), eventID, hostID)
-	if err != nil {
-		if errors.Is(err, event.ErrNotFound) {
-			apierror.Respond(c, apierror.New(http.StatusNotFound, "not_found", "event not found"))
-		} else {
-			apierror.Respond(c, err)
-		}
-		return event.Event{}, false
-	}
-	return evt, true
+	return resolveOwnedEvent(c, h.events, h.profiles)
 }
 
 func (h *LiveWallHandler) Create(c *gin.Context) {
@@ -63,7 +47,13 @@ func (h *LiveWallHandler) Create(c *gin.Context) {
 	if !ok {
 		return
 	}
-	session, token, err := h.sessions.Create(c.Request.Context(), evt.ID, evt.Name, evt.Slug)
+	// A plan without the full Live Wall starts on Classic, the one transition
+	// every plan includes.
+	var transition []livewall.TransitionMode
+	if !h.gate.view(c, evt.ID).allows(c, catalog.FeatureFullLiveWall) {
+		transition = append(transition, livewall.TransitionModeClassic)
+	}
+	session, token, err := h.sessions.Create(c.Request.Context(), evt.ID, evt.Name, evt.Slug, transition...)
 	if err != nil {
 		apierror.Respond(c, err)
 		return
@@ -131,6 +121,9 @@ func (h *LiveWallHandler) Update(c *gin.Context) {
 	var request liveWallUpdateRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		apierror.Respond(c, apierror.New(http.StatusBadRequest, "invalid_live_wall_settings", "invalid live wall settings"))
+		return
+	}
+	if !h.gate.require(c, evt.ID, liveWallFeatures(request)...) {
 		return
 	}
 	session, err := h.sessions.UpdatePresentation(c.Request.Context(), evt.ID, id, livewall.PresentationSettings{
@@ -201,11 +194,31 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "60"))
+	// The plan shapes what the projector gets rather than refusing it: a wall
+	// already on screen keeps playing, within what the event's plan includes.
+	plan := h.gate.view(c, session.EventID)
+	fullWall := plan.allows(c, catalog.FeatureFullLiveWall)
+	maxItems := int64(0)
+	if limits, ok := plan.limits(); ok && !fullWall && limits.MaxLiveWallItems > 0 {
+		maxItems = limits.MaxLiveWallItems
+		if limit <= 0 || int64(limit) > maxItems {
+			limit = int(maxItems)
+		}
+	}
+	transitionMode := session.TransitionMode
+	if !liveWallTransitionAllowed(c, plan, transitionMode) {
+		transitionMode = livewall.TransitionModeClassic
+	}
 	filter := media.FilterAll
 	if session.ContentPolicy == livewall.ContentPolicyFeaturedOnly || session.LayoutMode == livewall.LayoutModeFeatured {
 		filter = media.FilterFavorites
 	}
-	items, err := h.media.ListGallery(c.Request.Context(), session.EventID, filter, media.SortNewest, limit, c.Query("cursor"), func(id uuid.UUID) string {
+	cursor := c.Query("cursor")
+	if maxItems > 0 {
+		// A capped wall is the newest maxItems media, one page, no paging.
+		cursor = ""
+	}
+	items, err := h.media.ListGallery(c.Request.Context(), session.EventID, filter, media.SortNewest, limit, cursor, func(id uuid.UUID) string {
 		return "/api/v1/public/live-wall-sessions/" + token + "/media/" + id.String() + "/content"
 	})
 	if err != nil {
@@ -218,6 +231,9 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 	if err := h.media.SignPage(c.Request.Context(), items.Data, mediaLinkExpiry); err != nil {
 		apierror.Respond(c, err)
 		return
+	}
+	if maxItems > 0 {
+		items.NextCursor, items.HasMore = "", false
 	}
 	// Theme is optional presentation metadata. A missing or unavailable event
 	// must not prevent an already-authorized player session from showing media.
@@ -240,7 +256,10 @@ func (h *LiveWallHandler) Player(c *gin.Context) {
 			"slide_duration_seconds": session.SlideDuration,
 			"qr_strategy":            session.QRStrategy,
 			"arrival_behavior":       session.ArrivalBehavior,
-			"transition_mode":        session.TransitionMode,
+			"transition_mode":        transitionMode,
+			// 0 means no cap. A capped player keeps only this many newest media,
+			// including ones that arrive over the stream.
+			"max_items": maxItems,
 		},
 		"data": items.Data,
 		"page": gin.H{"next_cursor": items.NextCursor, "has_more": items.HasMore},
@@ -329,5 +348,37 @@ func (h *LiveWallHandler) Stream(c *gin.Context) {
 			}
 			w.Flush()
 		}
+	}
+}
+
+// liveWallFeatures lists the plan features a presentation change needs.
+// Classic and the layout and pacing controls are on every plan.
+func liveWallFeatures(request liveWallUpdateRequest) []catalog.Feature {
+	var features []catalog.Feature
+	if request.TransitionMode != nil {
+		switch *request.TransitionMode {
+		case livewall.TransitionModeClassic:
+		case livewall.TransitionModeLivingMosaic:
+			features = append(features, catalog.FeatureThroughTheMoment)
+		default:
+			features = append(features, catalog.FeatureFullLiveWall)
+		}
+	}
+	// Showing only featured media needs the ability to feature media.
+	if (request.ContentPolicy != nil && *request.ContentPolicy == livewall.ContentPolicyFeaturedOnly) ||
+		(request.LayoutMode != nil && *request.LayoutMode == livewall.LayoutModeFeatured) {
+		features = append(features, catalog.FeatureFeatureMedia)
+	}
+	return features
+}
+
+func liveWallTransitionAllowed(c *gin.Context, plan planView, mode livewall.TransitionMode) bool {
+	switch mode {
+	case livewall.TransitionModeClassic:
+		return true
+	case livewall.TransitionModeLivingMosaic:
+		return plan.allows(c, catalog.FeatureThroughTheMoment)
+	default:
+		return plan.allows(c, catalog.FeatureFullLiveWall)
 	}
 }

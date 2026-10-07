@@ -62,7 +62,7 @@ func newMemoryRepository() *memoryRepository {
 	return &memoryRepository{records: map[uuid.UUID]Media{}, ready: map[uuid.UUID]bool{}}
 }
 
-func (r *memoryRepository) ReserveUpload(_ context.Context, record Media, _ int64) error {
+func (r *memoryRepository) ReserveUpload(_ context.Context, record Media, _ ReserveLimits) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records[record.ID] = record
@@ -152,14 +152,28 @@ func (r *memoryRepository) MarkReady(_ context.Context, eventID, id uuid.UUID, a
 	r.records[id], r.ready[id] = record, true
 	return nil
 }
-func (r *memoryRepository) MarkThumbnailReady(_ context.Context, eventID, id uuid.UUID) error {
+func (r *memoryRepository) UpdateProcessingResult(_ context.Context, eventID, id uuid.UUID, thumbnailReady bool, metadata PresentationMetadata) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	record, ok := r.records[id]
 	if !ok || record.EventID != eventID {
 		return ErrNotFound
 	}
-	record.ThumbnailReady = true
+	if thumbnailReady {
+		record.ThumbnailReady = true
+	}
+	if metadata.Width != nil {
+		record.Width = metadata.Width
+	}
+	if metadata.Height != nil {
+		record.Height = metadata.Height
+	}
+	if metadata.DurationSeconds != nil {
+		record.DurationSeconds = metadata.DurationSeconds
+	}
+	if metadata.TransitionCueSeconds != nil {
+		record.TransitionCueSeconds = metadata.TransitionCueSeconds
+	}
 	r.records[id] = record
 	return nil
 }
@@ -537,6 +551,8 @@ func TestGenerateThumbnailStoresVariantAndAnnouncesIt(t *testing.T) {
 
 	require.Equal(t, 1, storage.putCount())
 	require.True(t, repo.records[id].ThumbnailReady)
+	require.Equal(t, 1600, *repo.records[id].Width)
+	require.Equal(t, 900, *repo.records[id].Height)
 	require.Len(t, notifier.changes, 1)
 	require.Equal(t, ChangeThumbnail, notifier.changes[0].Kind)
 
@@ -544,6 +560,40 @@ func TestGenerateThumbnailStoresVariantAndAnnouncesIt(t *testing.T) {
 	// at-least-once delivery, not exactly-once.
 	require.NoError(t, service.GenerateThumbnail(context.Background(), id))
 	require.Equal(t, 1, storage.putCount())
+}
+
+func TestParseVideoProbeReturnsDisplayDimensionsDurationAndSafeCue(t *testing.T) {
+	metadata := parseVideoProbe([]byte(`{
+		"streams": [{
+			"width": 1920,
+			"height": 1080,
+			"duration": "12.500",
+			"side_data_list": [{"rotation": -90}]
+		}],
+		"format": {"duration": "12.500"}
+	}`))
+
+	require.NotNil(t, metadata.Width)
+	require.NotNil(t, metadata.Height)
+	require.NotNil(t, metadata.DurationSeconds)
+	require.NotNil(t, metadata.TransitionCueSeconds)
+	require.Equal(t, 1080, *metadata.Width)
+	require.Equal(t, 1920, *metadata.Height)
+	require.Equal(t, 12.5, *metadata.DurationSeconds)
+	require.Equal(t, 5.25, *metadata.TransitionCueSeconds)
+}
+
+func TestTransitionCueAvoidsVideoEdges(t *testing.T) {
+	shortCue := transitionCueForDuration(0.6)
+	regularCue := transitionCueForDuration(4)
+	longCue := transitionCueForDuration(60)
+
+	require.InDelta(t, 0.3, *shortCue, 0.001)
+	require.GreaterOrEqual(t, *regularCue, 0.35)
+	require.LessOrEqual(t, *regularCue, 4.0-0.35)
+	require.GreaterOrEqual(t, *longCue, 1.5)
+	require.LessOrEqual(t, *longCue, 60.0-1.5)
+	require.Nil(t, transitionCueForDuration(0))
 }
 
 func TestGenerateThumbnailDoesNotRetryPermanentConditions(t *testing.T) {
@@ -563,6 +613,22 @@ func TestGenerateThumbnailDoesNotRetryPermanentConditions(t *testing.T) {
 		require.NoError(t, service.GenerateThumbnail(context.Background(), id),
 			"an undecodable body is permanent, so the job must not be retried")
 		require.Equal(t, 0, storage.putCount())
+		require.False(t, repo.records[id].ThumbnailReady)
+	})
+
+	t.Run("video without ffmpeg does not fail job", func(t *testing.T) {
+		repo := newMemoryRepository()
+		id := uuid.New()
+		repo.records[id] = Media{
+			ID:             id,
+			EventID:        eventID,
+			MIMEType:       "video/mp4",
+			ObjectKey:      "events/" + eventID.String() + "/media/" + id.String() + "/original.mp4",
+			Status:         StatusReady,
+			ThumbnailReady: false,
+		}
+		service := NewService(repo, newThumbnailStorage(nil), allowAllLimiter{}, time.Minute, time.Minute, 10, 100, 100)
+		require.NoError(t, service.GenerateThumbnail(context.Background(), id))
 		require.False(t, repo.records[id].ThumbnailReady)
 	})
 }

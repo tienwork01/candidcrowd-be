@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/apierror"
+	"github.com/candidcrowd/candidcrowd-backend/internal/billing"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/auth"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
@@ -17,19 +19,26 @@ import (
 )
 
 type RouterConfig struct {
-	Logger         *slog.Logger
-	Auth           *auth.Verifier
-	Limiter        *redis.Limiter
-	AllowedOrigins []string
-	DatabaseReady  func(context.Context) error
-	Profiles       *profile.Handler
-	Events         *event.Handler
-	HostMedia      *HostMediaHandler
-	Insights       *InsightsHandler
-	Exports        *ExportHandler
-	LiveWall       *LiveWallHandler
-	Public         *PublicHandler
-	QRLogo         *QRLogoHandler
+	Logger                   *slog.Logger
+	Auth                     *auth.Verifier
+	Limiter                  *redis.Limiter
+	RateLimitEventCreateIP   int
+	RateLimitEventCreateHost int
+	AllowedOrigins           []string
+	DatabaseReady            func(context.Context) error
+	Profiles                 *profile.Handler
+	Events                   *event.Handler
+	HostMedia                *HostMediaHandler
+	Insights                 *InsightsHandler
+	Exports                  *ExportHandler
+	LiveWall                 *LiveWallHandler
+	Public                   *PublicHandler
+	QRLogo                   *QRLogoHandler
+	Plans                    *PlanHandler
+	// Catalog is nil when PLANS_CATALOG_ENABLED is off, and /plans is not mounted.
+	Catalog *catalog.Handler
+	// Billing is nil when BILLING_ENABLED is off, and checkout routes are not mounted.
+	Billing *billing.Handler
 	// Stream is nil when realtime is disabled for the deployment, in which
 	// case the stream routes are simply not mounted.
 	Stream *StreamHandler
@@ -58,9 +67,37 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	me := api.Group("/me", cfg.Auth.Middleware())
 	me.GET("", cfg.Profiles.Me)
 	me.POST("/consents", cfg.Profiles.Accept)
+	me.GET("/event-plans", cfg.Plans.HostEventPlans)
+	if cfg.Catalog != nil {
+		api.GET("/plans", cfg.Catalog.List)
+	}
 
 	host := api.Group("/events", cfg.Auth.Middleware())
-	host.POST("", cfg.Events.Create)
+
+	var createHandlers []gin.HandlerFunc
+	if cfg.Limiter != nil {
+		ipLimit := cfg.RateLimitEventCreateIP
+		if ipLimit <= 0 {
+			ipLimit = 10
+		}
+		hostLimit := cfg.RateLimitEventCreateHost
+		if hostLimit <= 0 {
+			hostLimit = 2
+		}
+		createHandlers = append(createHandlers,
+			rateLimitMiddleware(cfg.Limiter, "rate:ip:event_create", resolveClientIP, ipLimit, time.Minute),
+			rateLimitMiddleware(cfg.Limiter, "rate:host:event_create", func(c *gin.Context) string {
+				identity, err := auth.Get(c)
+				if err == nil && identity.BetterAuthUserID != "" {
+					return identity.BetterAuthUserID
+				}
+				return resolveClientIP(c)
+			}, hostLimit, time.Minute),
+		)
+	}
+	createHandlers = append(createHandlers, cfg.Events.Create)
+	host.POST("", createHandlers...)
+	host.POST("/:id/close", cfg.Events.Close)
 	host.GET("", cfg.Events.List)
 	host.GET("/:id", cfg.Events.Get)
 	host.PATCH("/:id", cfg.Events.Update)
@@ -68,7 +105,10 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	host.POST("/:id/qr-logo/upload-target", cfg.QRLogo.CreateUploadTarget)
 	host.POST("/:id/qr-logo/:assetId/complete", cfg.QRLogo.Complete)
 	host.DELETE("/:id", cfg.Events.Delete)
+	host.GET("/:id/plan", cfg.Plans.EventPlan)
+	host.GET("/:id/usage", cfg.Plans.EventUsage)
 	host.POST("/:id/exports", cfg.Exports.Create)
+	host.GET("/:id/exports/latest", cfg.Exports.Latest)
 	host.GET("/:id/exports/:exportId", cfg.Exports.Get)
 	host.GET("/:id/analytics", cfg.Insights.Analytics)
 	host.GET("/:id/qr-sources", cfg.Insights.ListSources)
@@ -86,6 +126,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	host.PATCH("/:id/live-wall-sessions/:sessionId", cfg.LiveWall.Update)
 	host.POST("/:id/live-wall-sessions/:sessionId/end", cfg.LiveWall.End)
 	host.POST("/:id/live-wall-sessions/:sessionId/commands", cfg.LiveWall.Command)
+	if cfg.Billing != nil {
+		host.GET("/:id/offers", cfg.Billing.Offers)
+		host.POST("/:id/checkout", cfg.Billing.CreateCheckout)
+		billingGroup := api.Group("/billing", cfg.Auth.Middleware())
+		billingGroup.GET("/purchases/:purchaseId", cfg.Billing.GetPurchase)
+		api.POST("/webhooks/paddle", cfg.Billing.Webhook)
+	}
 
 	pub := api.Group("/public/events/:slug")
 	pub.GET("", cfg.Public.Event)
@@ -148,4 +195,33 @@ func recovery(log *slog.Logger) gin.HandlerFunc {
 		log.Error("panic recovered", "error", recovered)
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{"code": "internal_error", "message": "an unexpected error occurred"}})
 	})
+}
+
+func resolveClientIP(c *gin.Context) string {
+	if cfIP := c.GetHeader("CF-Connecting-IP"); cfIP != "" {
+		return cfIP
+	}
+	return c.ClientIP()
+}
+
+func rateLimitMiddleware(limiter *redis.Limiter, keyPrefix string, keyFunc func(c *gin.Context) string, limit int, window time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if limiter == nil || limit <= 0 {
+			c.Next()
+			return
+		}
+		key := keyPrefix + ":" + keyFunc(c)
+		allowed, err := limiter.Allow(c.Request.Context(), key, limit, window)
+		if err != nil {
+			// Fail-open: Redis connectivity issue must not block valid users
+			c.Next()
+			return
+		}
+		if !allowed {
+			apierror.Respond(c, apierror.New(http.StatusTooManyRequests, "rate_limit_exceeded", "too many requests, please try again later"))
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }

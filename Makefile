@@ -8,7 +8,9 @@ run-worker: ; RUN_WORKER=true go run ./cmd/api
 build: ; go build -o bin/$(APP) ./cmd/api
 test: ; go test ./...
 test-integration: ; docker compose -f docker-compose.test.yml up --abort-on-container-exit
-test-integration-db: ; go test -tags integration -count=1 ./internal/platform/database/
+# -p 1: the packages share one database, and the plan backfill test acts on
+# every event in it, so packages must not run concurrently.
+test-integration-db: ; go test -tags integration -count=1 -p 1 ./internal/platform/database/ ./internal/entitlement/ ./internal/httpapi/ ./internal/retention/ ./internal/billing/
 lint: ; golangci-lint run
 fmt: ; go fmt ./...
 vet: ; go vet ./...

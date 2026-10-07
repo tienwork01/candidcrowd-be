@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -24,8 +25,8 @@ func NewMediaRepository(db *gorm.DB) *MediaRepository {
 	return &MediaRepository{db: db}
 }
 
-// ReserveUpload takes the event's storage quota and creates the pending media
-// record.
+// ReserveUpload takes the event's storage and item quota and creates the
+// pending media record.
 //
 // The quota check is a single conditional UPDATE rather than a row lock held
 // across an aggregate. Every guest at one event contends on the same event
@@ -33,44 +34,101 @@ func NewMediaRepository(db *gorm.DB) *MediaRepository {
 // start uploading at once: the previous SELECT ... FOR UPDATE held it for a
 // lock round trip plus a SUM() over the event's whole media history.
 //
-// The counter it maintains is released by MarkReady (upload succeeded),
-// ExpireStale (upload abandoned) and Delete (target could not be handed out).
-func (r *MediaRepository) ReserveUpload(ctx context.Context, record media.Media, maxEventBytes int64) error {
+// Bytes and items (overall, and photo or video) are reserved in the same
+// statement, so concurrent uploads near a limit can never overshoot it. The
+// reservation is released by MarkReady (upload succeeded), ExpireStale
+// (upload abandoned) and Delete (target could not be handed out).
+func (r *MediaRepository) ReserveUpload(ctx context.Context, record media.Media, limits media.ReserveLimits) error {
+	photo, video := media.MediaKind(record.MIMEType)
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// A limit of 0 means "whatever the event allows"; NULLIF keeps that
-		// decision in SQL so there is no read before the write.
+		// A byte limit of 0 means "whatever the event allows" and an item
+		// limit of 0 means "no limit"; both decisions stay in SQL so there is
+		// no read before the write.
 		reserve := tx.Exec(`
 			UPDATE events
-			SET reserved_media_bytes = reserved_media_bytes + ?
-			WHERE id = ?
-			  AND status = ?
-			  AND used_media_bytes + reserved_media_bytes + ? <= COALESCE(NULLIF(?::bigint, 0::bigint), max_media_bytes)`,
-			record.ExpectedSize, record.EventID, event.StatusActive, record.ExpectedSize, maxEventBytes)
+			SET reserved_media_bytes = reserved_media_bytes + @size,
+			    reserved_media_items = reserved_media_items + 1,
+			    reserved_photo_items = reserved_photo_items + @photo,
+			    reserved_video_items = reserved_video_items + @video
+			WHERE id = @event
+			  AND status = @active
+			  AND used_media_bytes + reserved_media_bytes + @size <= COALESCE(NULLIF(CAST(@max_bytes AS bigint), 0::bigint), max_media_bytes)
+			  AND (NOT @enforce_items OR (
+			        (max_media_items = 0 OR uploaded_media_items + reserved_media_items + 1 <= max_media_items)
+			    AND (@photo = 0 OR max_photo_items = 0 OR uploaded_photo_items + reserved_photo_items + 1 <= max_photo_items)
+			    AND (@video = 0 OR max_video_items = 0 OR uploaded_video_items + reserved_video_items + 1 <= max_video_items)))`,
+			sql.Named("size", record.ExpectedSize), sql.Named("photo", photo), sql.Named("video", video),
+			sql.Named("event", record.EventID), sql.Named("active", event.StatusActive),
+			sql.Named("max_bytes", limits.MaxEventBytes), sql.Named("enforce_items", limits.EnforceItems))
 		if reserve.Error != nil {
 			return reserve.Error
 		}
 		if reserve.RowsAffected != 1 {
 			// Only the rejected path pays for a read, and only to tell the
-			// guest which of the two reasons applies.
-			return reservationRefusal(tx, record.EventID)
+			// guest which limit applies.
+			return reservationRefusal(tx, record, limits)
 		}
 		// A failure here rolls the reservation back with the transaction.
 		return tx.Create(&record).Error
 	})
 }
 
+// eventQuota is the quota state of one event row.
+type eventQuota struct {
+	Status             event.Status
+	MaxMediaBytes      int64
+	UsedMediaBytes     int64
+	ReservedMediaBytes int64
+	MaxMediaItems      int64
+	UploadedMediaItems int64
+	ReservedMediaItems int64
+	MaxPhotoItems      int64
+	UploadedPhotoItems int64
+	ReservedPhotoItems int64
+	MaxVideoItems      int64
+	UploadedVideoItems int64
+	ReservedVideoItems int64
+}
+
 // reservationRefusal explains why a reservation did not take. It runs only
 // after the conditional UPDATE matched nothing, so it never costs an accepted
 // upload anything.
-func reservationRefusal(tx *gorm.DB, eventID uuid.UUID) error {
-	var evt event.Event
-	if err := tx.Select("status").First(&evt, "id = ?", eventID).Error; err != nil {
-		return mapMediaNotFound(err)
+func reservationRefusal(tx *gorm.DB, record media.Media, limits media.ReserveLimits) error {
+	var q eventQuota
+	err := tx.Raw(`SELECT status, max_media_bytes, used_media_bytes, reserved_media_bytes,
+		       max_media_items, uploaded_media_items, reserved_media_items,
+		       max_photo_items, uploaded_photo_items, reserved_photo_items,
+		       max_video_items, uploaded_video_items, reserved_video_items
+		FROM events WHERE id = ?`, record.EventID).Row().Scan(
+		&q.Status, &q.MaxMediaBytes, &q.UsedMediaBytes, &q.ReservedMediaBytes,
+		&q.MaxMediaItems, &q.UploadedMediaItems, &q.ReservedMediaItems,
+		&q.MaxPhotoItems, &q.UploadedPhotoItems, &q.ReservedPhotoItems,
+		&q.MaxVideoItems, &q.UploadedVideoItems, &q.ReservedVideoItems)
+	if errors.Is(err, sql.ErrNoRows) {
+		return media.ErrNotFound
 	}
-	if evt.Status != event.StatusActive {
+	if err != nil {
+		return err
+	}
+	if q.Status != event.StatusActive {
 		return fmt.Errorf("event is not accepting uploads")
 	}
-	return fmt.Errorf("event storage quota exceeded")
+	photo, video := media.MediaKind(record.MIMEType)
+	if limits.EnforceItems {
+		switch {
+		case video == 1 && q.MaxVideoItems > 0 && q.UploadedVideoItems+q.ReservedVideoItems+1 > q.MaxVideoItems:
+			return &media.QuotaError{Resource: media.ResourceVideo, Limit: q.MaxVideoItems, Usage: q.UploadedVideoItems + q.ReservedVideoItems}
+		case photo == 1 && q.MaxPhotoItems > 0 && q.UploadedPhotoItems+q.ReservedPhotoItems+1 > q.MaxPhotoItems:
+			return &media.QuotaError{Resource: media.ResourcePhoto, Limit: q.MaxPhotoItems, Usage: q.UploadedPhotoItems + q.ReservedPhotoItems}
+		case q.MaxMediaItems > 0 && q.UploadedMediaItems+q.ReservedMediaItems+1 > q.MaxMediaItems:
+			return &media.QuotaError{Resource: media.ResourceMedia, Limit: q.MaxMediaItems, Usage: q.UploadedMediaItems + q.ReservedMediaItems}
+		}
+	}
+	maxBytes := q.MaxMediaBytes
+	if limits.MaxEventBytes > 0 {
+		maxBytes = limits.MaxEventBytes
+	}
+	return &media.QuotaError{Resource: media.ResourceBytes, Limit: maxBytes, Usage: q.UsedMediaBytes + q.ReservedMediaBytes}
 }
 
 func (r *MediaRepository) FindByClientUpload(ctx context.Context, eventID, sessionID, clientUploadID uuid.UUID) (media.Media, error) {
@@ -100,7 +158,7 @@ func (r *MediaRepository) Delete(ctx context.Context, mediaID uuid.UUID) error {
 }
 
 // DeleteManyUploads removes never-completed upload records and gives their
-// reserved bytes back, in one statement.
+// reserved bytes and items back, in one statement.
 //
 // The releases are summed per event before the update, so several abandoned
 // uploads belonging to the same event are subtracted once rather than the
@@ -112,15 +170,22 @@ func (r *MediaRepository) DeleteManyUploads(ctx context.Context, mediaIDs []uuid
 	return r.db.WithContext(ctx).Exec(`
 		WITH removed AS (
 			DELETE FROM media WHERE id IN ?
-			RETURNING event_id, expected_size, status
+			RETURNING event_id, expected_size, status, mime_type
 		), released AS (
-			SELECT event_id, SUM(expected_size) AS bytes
+			SELECT event_id,
+			       SUM(expected_size) AS bytes,
+			       COUNT(*) AS items,
+			       COUNT(*) FILTER (WHERE mime_type LIKE 'image/%') AS photos,
+			       COUNT(*) FILTER (WHERE mime_type LIKE 'video/%') AS videos
 			FROM removed
 			WHERE status IN ('pending', 'uploading', 'uploaded')
 			GROUP BY event_id
 		)
 		UPDATE events e
-		SET reserved_media_bytes = GREATEST(e.reserved_media_bytes - released.bytes, 0)
+		SET reserved_media_bytes = GREATEST(e.reserved_media_bytes - released.bytes, 0),
+		    reserved_media_items = GREATEST(e.reserved_media_items - released.items, 0),
+		    reserved_photo_items = GREATEST(e.reserved_photo_items - released.photos, 0),
+		    reserved_video_items = GREATEST(e.reserved_video_items - released.videos, 0)
 		FROM released
 		WHERE e.id = released.event_id`, mediaIDs).Error
 }
@@ -208,16 +273,28 @@ func (r *MediaRepository) MarkReady(ctx context.Context, eventID, mediaID uuid.U
 		if result.RowsAffected != 1 {
 			return media.ErrNotFound
 		}
-		// The reservation becomes usage. Both columns move in one statement so
-		// the pair is never observed half-applied, and expected_size is read
-		// from the row this transaction just updated rather than fetched in a
-		// second round trip.
+		// The reservation becomes usage. Every counter moves in one statement
+		// so the set is never observed half-applied, and the size and kind are
+		// read from the row this transaction just updated rather than fetched
+		// in a second round trip.
 		if err := tx.Exec(`
-			UPDATE events
-			SET used_media_bytes = used_media_bytes + ?,
-			    reserved_media_bytes = GREATEST(
-			        reserved_media_bytes - COALESCE((SELECT expected_size FROM media WHERE id = ?), 0), 0)
-			WHERE id = ?`, actualSize, mediaID, eventID).Error; err != nil {
+			UPDATE events e
+			SET used_media_bytes = e.used_media_bytes + @actual,
+			    reserved_media_bytes = GREATEST(e.reserved_media_bytes - m.expected_size, 0),
+			    uploaded_media_items = e.uploaded_media_items + 1,
+			    reserved_media_items = GREATEST(e.reserved_media_items - 1, 0),
+			    uploaded_photo_items = e.uploaded_photo_items + m.photo,
+			    reserved_photo_items = GREATEST(e.reserved_photo_items - m.photo, 0),
+			    uploaded_video_items = e.uploaded_video_items + m.video,
+			    reserved_video_items = GREATEST(e.reserved_video_items - m.video, 0)
+			FROM (
+				SELECT expected_size,
+				       CASE WHEN mime_type LIKE 'image/%' THEN 1 ELSE 0 END AS photo,
+				       CASE WHEN mime_type LIKE 'video/%' THEN 1 ELSE 0 END AS video
+				FROM media WHERE id = @media
+			) m
+			WHERE e.id = @event`,
+			sql.Named("actual", actualSize), sql.Named("media", mediaID), sql.Named("event", eventID)).Error; err != nil {
 			return err
 		}
 		// Deferred work is enqueued in the transaction that makes the record
@@ -226,19 +303,38 @@ func (r *MediaRepository) MarkReady(ctx context.Context, eventID, mediaID uuid.U
 		// (media_id, kind) index makes a retried complete a no-op.
 		return tx.Exec(`
 			INSERT INTO media_jobs (media_id, kind)
-			SELECT id, ? FROM media WHERE id = ? AND mime_type LIKE 'image/%'
+			SELECT id, ? FROM media WHERE id = ? AND (mime_type LIKE 'image/%' OR mime_type LIKE 'video/%')
 			ON CONFLICT (media_id, kind) DO NOTHING`, mediajob.KindThumbnail, mediaID).Error
 	})
 }
 
-func (r *MediaRepository) MarkThumbnailReady(ctx context.Context, eventID, mediaID uuid.UUID) error {
+func (r *MediaRepository) UpdateProcessingResult(ctx context.Context, eventID, mediaID uuid.UUID, thumbnailReady bool, metadata media.PresentationMetadata) error {
 	// Featured and hidden are moderation states of an already-ready record. A
 	// host curating the gallery while a thumbnail renders must not strand the
 	// result.
+	updates := map[string]any{}
+	if thumbnailReady {
+		updates["thumbnail_ready"] = true
+	}
+	if metadata.Width != nil {
+		updates["width"] = *metadata.Width
+	}
+	if metadata.Height != nil {
+		updates["height"] = *metadata.Height
+	}
+	if metadata.DurationSeconds != nil {
+		updates["duration_seconds"] = *metadata.DurationSeconds
+	}
+	if metadata.TransitionCueSeconds != nil {
+		updates["transition_cue_seconds"] = *metadata.TransitionCueSeconds
+	}
+	if len(updates) == 0 {
+		return nil
+	}
 	result := r.db.WithContext(ctx).Model(&media.Media{}).
 		Where("id = ? AND event_id = ? AND status IN ?", mediaID, eventID,
 			[]media.Status{media.StatusReady, media.StatusFeatured, media.StatusHidden}).
-		Update("thumbnail_ready", true)
+		Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}

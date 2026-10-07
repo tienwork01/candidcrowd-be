@@ -100,15 +100,15 @@ func TestReservedBytesSurviveTheFullUploadLifecycle(t *testing.T) {
 
 	completed := pendingRecord(eventID, sessionID, 400)
 	abandoned := pendingRecord(eventID, sessionID, 400)
-	require.NoError(t, repo.ReserveUpload(ctx, completed, 0))
-	require.NoError(t, repo.ReserveUpload(ctx, abandoned, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, completed, media.ReserveLimits{}))
+	require.NoError(t, repo.ReserveUpload(ctx, abandoned, media.ReserveLimits{}))
 
 	counter, truth := reservedCounter(t, db, eventID)
 	require.EqualValues(t, 800, counter)
 	require.Equal(t, truth, counter)
 
 	// A third upload does not fit beside the two outstanding reservations.
-	require.Error(t, repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 400), 0),
+	require.Error(t, repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 400), media.ReserveLimits{}),
 		"quota must account for bytes that are reserved but not yet uploaded")
 
 	// Completing converts the reservation into usage at the real size.
@@ -125,7 +125,7 @@ func TestReservedBytesSurviveTheFullUploadLifecycle(t *testing.T) {
 	require.Equal(t, truth, counter)
 
 	// With the quota freed, a new upload is accepted again.
-	require.NoError(t, repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 400), 0))
+	require.NoError(t, repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 400), media.ReserveLimits{}))
 	counter, truth = reservedCounter(t, db, eventID)
 	require.Equal(t, truth, counter, "counter drifted from the outstanding reservations")
 }
@@ -142,7 +142,7 @@ func TestConcurrentReservationsCannotExceedTheQuota(t *testing.T) {
 	results := make(chan error, attempts)
 	for i := 0; i < attempts; i++ {
 		go func() {
-			results <- repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 100), 0)
+			results <- repo.ReserveUpload(ctx, pendingRecord(eventID, sessionID, 100), media.ReserveLimits{})
 		}()
 	}
 	accepted := 0
@@ -170,7 +170,7 @@ func TestConcurrentCompletionsKeepTheCounterExact(t *testing.T) {
 	records := make([]media.Media, 0, uploads)
 	for i := 0; i < uploads; i++ {
 		record := pendingRecord(eventID, sessionID, 100)
-		require.NoError(t, repo.ReserveUpload(ctx, record, 0))
+		require.NoError(t, repo.ReserveUpload(ctx, record, media.ReserveLimits{}))
 		records = append(records, record)
 	}
 
@@ -190,9 +190,9 @@ func TestConcurrentCompletionsKeepTheCounterExact(t *testing.T) {
 	require.Zero(t, evt.ReservedMediaBytes, "every reservation must be released exactly once")
 }
 
-// Completing an image enqueues its thumbnail in the same transaction, so the
+// Completing an image or video enqueues its thumbnail in the same transaction, so the
 // job cannot be lost the way the previous in-process goroutine could.
-func TestMarkReadyEnqueuesThumbnailWorkForImagesOnly(t *testing.T) {
+func TestMarkReadyEnqueuesThumbnailWorkForImagesAndVideos(t *testing.T) {
 	db := openTestDB(t)
 	repo := NewMediaRepository(db)
 	ctx := context.Background()
@@ -202,8 +202,8 @@ func TestMarkReadyEnqueuesThumbnailWorkForImagesOnly(t *testing.T) {
 	video := pendingRecord(eventID, sessionID, 100)
 	video.MIMEType = "video/mp4"
 	video.ObjectKey += ".mp4"
-	require.NoError(t, repo.ReserveUpload(ctx, image, 0))
-	require.NoError(t, repo.ReserveUpload(ctx, video, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, image, media.ReserveLimits{}))
+	require.NoError(t, repo.ReserveUpload(ctx, video, media.ReserveLimits{}))
 
 	require.NoError(t, repo.MarkReady(ctx, eventID, image.ID, 90, time.Now().UTC()))
 	require.NoError(t, repo.MarkReady(ctx, eventID, video.ID, 90, time.Now().UTC()))
@@ -212,7 +212,7 @@ func TestMarkReadyEnqueuesThumbnailWorkForImagesOnly(t *testing.T) {
 	require.NoError(t, db.Raw(
 		`SELECT media_id FROM media_jobs WHERE kind = 'thumbnail' AND media_id IN (?, ?)`,
 		image.ID, video.ID).Scan(&queued).Error)
-	require.Equal(t, []uuid.UUID{image.ID}, queued, "only images need a thumbnail")
+	require.ElementsMatch(t, []uuid.UUID{image.ID, video.ID}, queued, "both images and videos need a thumbnail")
 }
 
 // Archiving removes the original from hot storage. The listing has to learn
@@ -225,7 +225,7 @@ func TestArchivingMarksMediaSoTheGalleryStopsSigningIt(t *testing.T) {
 	eventID, sessionID := seedEvent(t, db, 10_000)
 
 	record := pendingRecord(eventID, sessionID, 100)
-	require.NoError(t, repo.ReserveUpload(ctx, record, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, record, media.ReserveLimits{}))
 	require.NoError(t, repo.MarkReady(ctx, eventID, record.ID, 90, time.Now().UTC()))
 
 	before, err := repo.FindByID(ctx, record.ID)
@@ -265,16 +265,16 @@ func TestDeleteManyUploadsReleasesQuotaPerEvent(t *testing.T) {
 	var abandoned []uuid.UUID
 	for i := 0; i < 3; i++ {
 		record := pendingRecord(firstEvent, firstSession, 100)
-		require.NoError(t, repo.ReserveUpload(ctx, record, 0))
+		require.NoError(t, repo.ReserveUpload(ctx, record, media.ReserveLimits{}))
 		abandoned = append(abandoned, record.ID)
 	}
 	other := pendingRecord(secondEvent, secondSession, 250)
-	require.NoError(t, repo.ReserveUpload(ctx, other, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, other, media.ReserveLimits{}))
 	abandoned = append(abandoned, other.ID)
 
 	// One that completed must not have its bytes released by the cleanup.
 	kept := pendingRecord(firstEvent, firstSession, 100)
-	require.NoError(t, repo.ReserveUpload(ctx, kept, 0))
+	require.NoError(t, repo.ReserveUpload(ctx, kept, media.ReserveLimits{}))
 	require.NoError(t, repo.MarkReady(ctx, firstEvent, kept.ID, 90, time.Now().UTC()))
 
 	counter, truth := reservedCounter(t, db, firstEvent)

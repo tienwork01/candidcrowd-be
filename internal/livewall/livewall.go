@@ -50,12 +50,13 @@ const (
 	QRStrategyEmptyOnly QRStrategy = "empty_only"
 	QRStrategyHidden    QRStrategy = "hidden"
 
-	ArrivalBehaviorQueue    ArrivalBehavior = "queue"
-	ArrivalBehaviorNext     ArrivalBehavior = "next"
-	TransitionModeClassic   TransitionMode  = "classic"
-	TransitionModeCinematic TransitionMode  = "cinematic"
-	TransitionModeFloat3D   TransitionMode  = "float_3d"
-	TransitionModeFlash     TransitionMode  = "flash"
+	ArrivalBehaviorQueue       ArrivalBehavior = "queue"
+	ArrivalBehaviorNext        ArrivalBehavior = "next"
+	TransitionModeClassic      TransitionMode  = "classic"
+	TransitionModeCinematic    TransitionMode  = "cinematic"
+	TransitionModeFloat3D      TransitionMode  = "float_3d"
+	TransitionModeFlash        TransitionMode  = "flash"
+	TransitionModeLivingMosaic TransitionMode  = "living_mosaic"
 )
 
 const (
@@ -290,7 +291,9 @@ func NewService(repo Repository, lifetime time.Duration, notifiers ...Notifier) 
 	return &Service{repo: repo, lifetime: lifetime, notifiers: notifiers}
 }
 
-func (s *Service) Create(ctx context.Context, eventID uuid.UUID, eventName, eventSlug string) (Session, string, error) {
+// Create starts a session. transition optionally overrides the default
+// transition, for an event whose plan does not include the default one.
+func (s *Service) Create(ctx context.Context, eventID uuid.UUID, eventName, eventSlug string, transition ...TransitionMode) (Session, string, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
 		return Session{}, "", err
@@ -301,6 +304,9 @@ func (s *Service) Create(ctx context.Context, eventID uuid.UUID, eventName, even
 	// Hosts can still switch to featured_only from the live controls when they
 	// need a curated display.
 	session := Session{ID: uuid.New(), EventID: eventID, EventName: eventName, EventSlug: eventSlug, TokenHash: tokenHash(token), Status: StatusLive, ContentPolicy: ContentPolicyAutoApproved, CTAEveryMedia: DefaultCTAEveryMedia, LayoutMode: LayoutModeSpotlight, SlideDuration: DefaultSlideDuration, QRStrategy: QRStrategyInterval, ArrivalBehavior: ArrivalBehaviorQueue, TransitionMode: TransitionModeCinematic, ExpiresAt: now.Add(s.lifetime), CreatedAt: now}
+	if len(transition) > 0 && transition[0] != "" {
+		session.TransitionMode = transition[0]
+	}
 	created, err := s.repo.Create(ctx, session)
 	return created, token, err
 }
@@ -365,7 +371,7 @@ func (s *Service) UpdatePresentation(ctx context.Context, eventID, id uuid.UUID,
 	if settings.ArrivalBehavior != nil && *settings.ArrivalBehavior != ArrivalBehaviorQueue && *settings.ArrivalBehavior != ArrivalBehaviorNext {
 		return Session{}, ErrInvalidPresentation
 	}
-	if settings.TransitionMode != nil && *settings.TransitionMode != TransitionModeClassic && *settings.TransitionMode != TransitionModeCinematic && *settings.TransitionMode != TransitionModeFloat3D && *settings.TransitionMode != TransitionModeFlash {
+	if settings.TransitionMode != nil && *settings.TransitionMode != TransitionModeClassic && *settings.TransitionMode != TransitionModeCinematic && *settings.TransitionMode != TransitionModeFloat3D && *settings.TransitionMode != TransitionModeFlash && *settings.TransitionMode != TransitionModeLivingMosaic {
 		return Session{}, ErrInvalidPresentation
 	}
 	session, err := s.repo.UpdatePresentation(ctx, eventID, id, settings)

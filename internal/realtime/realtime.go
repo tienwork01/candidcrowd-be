@@ -31,11 +31,14 @@ const (
 	KindMediaDeleted         Kind = "media.deleted"
 	KindEventUpdated         Kind = "event.updated"
 	KindLiveWallPresentation Kind = "live_wall.presentation"
+	// KindEventPlanUpdated tells host screens to refetch the event's plan,
+	// usage and anything gated by it. It is never sent to guests.
+	KindEventPlanUpdated Kind = "event.plan.updated"
 )
 
 func (k Kind) Valid() bool {
 	switch k {
-	case KindMediaCreated, KindMediaThumbnail, KindMediaUpdated, KindMediaDeleted, KindEventUpdated, KindLiveWallPresentation:
+	case KindMediaCreated, KindMediaThumbnail, KindMediaUpdated, KindMediaDeleted, KindEventUpdated, KindLiveWallPresentation, KindEventPlanUpdated:
 		return true
 	}
 	return false

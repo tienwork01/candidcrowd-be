@@ -36,13 +36,17 @@ type Media struct {
 	ChecksumSHA256   string `gorm:"column:checksum_sha256"`
 	// ClientUploadID is generated once by the browser and makes target creation
 	// safe to retry when a response is lost on a flaky connection.
-	ClientUploadID *uuid.UUID `gorm:"column:client_upload_id"`
-	Status         Status     `gorm:"type:media_status"`
-	CreatedAt      time.Time
-	LastActivityAt time.Time
-	UploadedAt     *time.Time
-	FailedAt       *time.Time
-	ThumbnailReady bool `gorm:"not null;default:false"`
+	ClientUploadID       *uuid.UUID `gorm:"column:client_upload_id"`
+	Status               Status     `gorm:"type:media_status"`
+	CreatedAt            time.Time
+	LastActivityAt       time.Time
+	UploadedAt           *time.Time
+	FailedAt             *time.Time
+	ThumbnailReady       bool     `gorm:"not null;default:false"`
+	Width                *int     `json:"width,omitempty"`
+	Height               *int     `json:"height,omitempty"`
+	DurationSeconds      *float64 `json:"duration_seconds,omitempty"`
+	TransitionCueSeconds *float64 `json:"transition_cue_seconds,omitempty"`
 	// SourceDeletedAt is set once the original has been archived and removed
 	// from hot storage. Its object key no longer resolves, so such a record
 	// must be served through the application rather than by a presigned URL.
@@ -93,15 +97,20 @@ const (
 // guest URL is a stable route the client already knows how to build from the
 // event slug. Keeping both out means no storage key ever leaves this process.
 type Item struct {
-	ID             uuid.UUID `json:"id"`
-	MIMEType       string    `json:"mime_type"`
-	CreatedAt      time.Time `json:"created_at"`
-	IsVideo        bool      `json:"is_video"`
-	HasEventFrame  bool      `json:"has_event_frame"`
-	ThumbnailReady bool      `json:"thumbnail_ready"`
-	Status         Status    `json:"status"`
-	GuestName      *string   `json:"guest_name,omitempty"`
-	Caption        *string   `json:"caption,omitempty"`
+	ID                   uuid.UUID `json:"id"`
+	MIMEType             string    `json:"mime_type"`
+	OriginalFilename     string    `json:"original_filename,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	IsVideo              bool      `json:"is_video"`
+	HasEventFrame        bool      `json:"has_event_frame"`
+	ThumbnailReady       bool      `json:"thumbnail_ready"`
+	Status               Status    `json:"status"`
+	GuestName            *string   `json:"guest_name,omitempty"`
+	Caption              *string   `json:"caption,omitempty"`
+	Width                *int      `json:"width,omitempty"`
+	Height               *int      `json:"height,omitempty"`
+	DurationSeconds      *float64  `json:"duration_seconds,omitempty"`
+	TransitionCueSeconds *float64  `json:"transition_cue_seconds,omitempty"`
 }
 
 // Change describes a media change worth telling connected browsers about.
@@ -122,15 +131,20 @@ type Notifier interface {
 
 func newItem(m Media) Item {
 	return Item{
-		ID:             m.ID,
-		MIMEType:       m.MIMEType,
-		CreatedAt:      m.CreatedAt,
-		IsVideo:        strings.HasPrefix(m.MIMEType, "video/"),
-		HasEventFrame:  strings.HasPrefix(m.OriginalFilename, "candid_"),
-		ThumbnailReady: m.ThumbnailReady,
-		Status:         m.Status,
-		GuestName:      m.GuestName,
-		Caption:        m.Caption,
+		ID:                   m.ID,
+		MIMEType:             m.MIMEType,
+		OriginalFilename:     m.OriginalFilename,
+		CreatedAt:            m.CreatedAt,
+		IsVideo:              strings.HasPrefix(m.MIMEType, "video/"),
+		HasEventFrame:        strings.HasPrefix(m.OriginalFilename, "candid_"),
+		ThumbnailReady:       m.ThumbnailReady,
+		Status:               m.Status,
+		GuestName:            m.GuestName,
+		Caption:              m.Caption,
+		Width:                m.Width,
+		Height:               m.Height,
+		DurationSeconds:      m.DurationSeconds,
+		TransitionCueSeconds: m.TransitionCueSeconds,
 	}
 }
 
@@ -139,20 +153,26 @@ func newItem(m Media) Item {
 // whichever replica currently holds the media; the caller cannot tell which
 // storage provider answered, and neither can it be made to.
 type PublicView struct {
-	ID       uuid.UUID `json:"id"`
-	URL      string    `json:"url"`
-	MIMEType string    `json:"mime_type"`
+	ID                   uuid.UUID `json:"id"`
+	URL                  string    `json:"url"`
+	DownloadURL          string    `json:"download_url,omitempty"`
+	MIMEType             string    `json:"mime_type"`
+	OriginalFilename     string    `json:"original_filename,omitempty"`
 	// ThumbnailURL is empty until the variant has been rendered.
-	ThumbnailURL   string    `json:"thumbnail_url"`
-	CreatedAt      time.Time `json:"created_at"`
-	IsVideo        bool      `json:"is_video"`
-	HasEventFrame  bool      `json:"has_event_frame"`
-	ThumbnailReady bool      `json:"thumbnail_ready"`
-	Status         Status    `json:"status"`
-	GuestName      *string   `json:"guest_name,omitempty"`
-	Caption        *string   `json:"caption,omitempty"`
-	objectKey      string
-	thumbnailKey   string
+	ThumbnailURL         string    `json:"thumbnail_url"`
+	CreatedAt            time.Time `json:"created_at"`
+	IsVideo              bool      `json:"is_video"`
+	HasEventFrame        bool      `json:"has_event_frame"`
+	ThumbnailReady       bool      `json:"thumbnail_ready"`
+	Status               Status    `json:"status"`
+	GuestName            *string   `json:"guest_name,omitempty"`
+	Caption              *string   `json:"caption,omitempty"`
+	Width                *int      `json:"width,omitempty"`
+	Height               *int      `json:"height,omitempty"`
+	DurationSeconds      *float64  `json:"duration_seconds,omitempty"`
+	TransitionCueSeconds *float64  `json:"transition_cue_seconds,omitempty"`
+	objectKey            string
+	thumbnailKey         string
 	// routeURL is the application route kept as the fallback for media whose
 	// original has been archived out of hot storage.
 	routeURL string

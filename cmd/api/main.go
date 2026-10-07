@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/candidcrowd/candidcrowd-backend/internal/archive"
+	"github.com/candidcrowd/candidcrowd-backend/internal/billing"
+	"github.com/candidcrowd/candidcrowd-backend/internal/catalog"
 	"github.com/candidcrowd/candidcrowd-backend/internal/config"
+	"github.com/candidcrowd/candidcrowd-backend/internal/entitlement"
 	"github.com/candidcrowd/candidcrowd-backend/internal/event"
 	"github.com/candidcrowd/candidcrowd-backend/internal/exportjob"
 	"github.com/candidcrowd/candidcrowd-backend/internal/guest"
@@ -25,11 +28,14 @@ import (
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/cors"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/database"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/googledrive"
+	"github.com/candidcrowd/candidcrowd-backend/internal/platform/paddle"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/r2"
 	"github.com/candidcrowd/candidcrowd-backend/internal/platform/redis"
 	"github.com/candidcrowd/candidcrowd-backend/internal/profile"
 	"github.com/candidcrowd/candidcrowd-backend/internal/realtime"
+	"github.com/candidcrowd/candidcrowd-backend/internal/retention"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -115,7 +121,14 @@ func run() error {
 		}
 	}()
 
-	events := event.NewService(event.NewGormRepository(db), cfg.EventMaxBytes, eventNotifiers...)
+	planCatalog := catalog.NewService(catalog.NewGormRepository(db))
+	// Every event is created together with its Free grant, in one transaction.
+	events := event.NewService(event.NewGormRepository(db, entitlement.NewProvisioner(planCatalog)), cfg.EventMaxBytes, eventNotifiers...).
+		WithLimits(cfg.MaxActiveEventsPerHost, cfg.MaxTrialEventsPer30Days, cfg.EventCreationLimitsEnabled)
+	entitlements := entitlement.NewService(entitlement.NewGormRepository(db), planCatalog,
+		entitlement.WithEnforcement(cfg.EntitlementEnforcementEnabled), entitlement.WithLogger(logger))
+	logger.Info("event plans", "enforcement", cfg.EntitlementEnforcementEnabled)
+	events.UsePlanGate(entitlements)
 	profiles := profile.NewService(profile.NewGormRepository(db), cfg.TermsVersion, cfg.PrivacyVersion)
 	eventHandler := event.NewHandler(events, profiles)
 	guests := guest.NewService(guest.NewGormRepository(db), 24*time.Hour)
@@ -134,8 +147,89 @@ func run() error {
 	}()
 	analytics := insights.NewService(insights.NewGormRepository(db),
 		insights.WithCache(analyticsCache, cfg.AnalyticsCacheTTL))
-	exports := exportjob.NewService(exportjob.NewGormRepository(db), storage, logger)
+	// The Drive client is a read dependency of the public gallery and bulk exports,
+	// not only of the archive job: once an original has been archived, serving it is the
+	// only way a guest or host can still retrieve that media. It is therefore built on
+	// every replica that has archiving configured, worker or not.
+	var driveReader *googledrive.Client
+	var archiveCron *cron.Cron
+	if cfg.DailyArchiveEnabled {
+		driveClient, driveErr := googledrive.New(ctx, cfg.GoogleDriveClientID, cfg.GoogleDriveSecret, cfg.GoogleDriveRefresh, cfg.GoogleDriveRootFolder)
+		if driveErr != nil {
+			return driveErr
+		}
+		driveReader = driveClient
+	}
+
+	var exportOpts []any
+	if logger != nil {
+		exportOpts = append(exportOpts, logger)
+	}
+	if driveReader != nil {
+		exportOpts = append(exportOpts, exportjob.WithArchiveReader(driveReader))
+	}
+	exports := exportjob.NewService(exportjob.NewGormRepository(db), storage, exportOpts...)
 	liveWall := livewall.NewService(livewall.NewGormRepository(db), 12*time.Hour, liveWallNotifiers...)
+
+	// The plan registry decides which plans exist, their upgrade order and which
+	// can be sold. Loading it from the database is what lets a new tier ship as
+	// data; a failure keeps the compiled-in catalog rather than refusing to boot.
+	if err := catalog.LoadRegistry(context.Background(), db); err != nil {
+		logger.Warn("using the built-in plan registry", "error", err)
+	}
+	logger.Info("plan registry loaded", "sellable", catalog.SellablePlans())
+
+	var (
+		billingService *billing.Service
+		billingHandler *billing.Handler
+	)
+	if cfg.BillingEnabled {
+		licenseService := entitlement.NewPurchaseLicenseService(db)
+		grantAdapter := &entitlementGrantAdapter{licenses: licenseService}
+		catReader := &catalogReaderAdapter{catalog: planCatalog, db: db}
+		ownerAdapter := &eventOwnershipAdapter{events: events, db: db}
+
+		var checkoutGateway billing.CheckoutGateway
+		var webhookDecoder billing.WebhookDecoder
+		if cfg.BillingProvider == "paddle" {
+			paddleClient := paddle.NewClient(cfg.PaddleEnvironment, cfg.PaddleAPIKey)
+			checkoutGateway = paddle.NewCheckoutAdapter(paddleClient, cfg.PaddleCheckoutURL)
+			webhookDecoder = paddle.NewWebhookVerifier(cfg.PaddleWebhookSecret)
+		}
+
+		billingService = billing.NewService(billing.Config{
+			Repo:       billing.NewGormRepository(db),
+			Checkout:   checkoutGateway,
+			Decoder:    webhookDecoder,
+			Grants:     grantAdapter,
+			Licenses:   &billingReversalAdapter{licenses: licenseService, db: db},
+			Plans:      catReader,
+			Ownership:  ownerAdapter,
+			EntSvc:     entitlements,
+			Provider:   billing.Provider(cfg.BillingProvider),
+			Currency:   cfg.BillingCurrency,
+			Enabled:    cfg.BillingEnabled,
+			SuccessURL: cfg.BillingSuccessURL,
+			CancelURL:  cfg.BillingCancelURL,
+			Logger:     logger,
+		})
+
+		billingHandler = billing.NewHandler(billingService, func(c *gin.Context) (uuid.UUID, error) {
+			identity, err := auth.Get(c)
+			if err != nil {
+				return uuid.Nil, err
+			}
+			return profiles.UserID(c.Request.Context(), identity)
+		})
+		logger.Info("billing enabled", "provider", cfg.BillingProvider, "currency", cfg.BillingCurrency)
+		// A missing product mapping only breaks checkout, so it must not stop
+		// the API from serving everything else. It is loud instead of fatal.
+		if gaps := billingService.ExecutionGaps(context.Background()); len(gaps) > 0 {
+			logger.Error("billing cannot charge for some plans: no provider product mapping",
+				"plans", gaps, "fix", "planctl product-map set --plan <code> --product-id <provider product>")
+		}
+	}
+
 	// Background work is gated so it can be moved off the request-serving
 	// replicas without a second binary: run one replica with RUN_WORKER=true
 	// and set RUN_WORKER=false on the rest. It defaults to on, so a
@@ -167,26 +261,52 @@ func run() error {
 		}); scheduleErr != nil {
 			return scheduleErr
 		}
+
+		if billingService != nil {
+			if _, scheduleErr := cleanupCron.AddFunc(cfg.BillingReconcileSchedule, func() {
+				jobCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if applied, errs := billingService.ReconcileUnapplied(jobCtx, cfg.BillingReconcileBatch); len(errs) > 0 {
+					logger.Error("billing reconciliation error", "errors", errs)
+				} else if applied > 0 {
+					logger.Info("billing reconciliation applied grants", "count", applied)
+				}
+			}); scheduleErr != nil {
+				return scheduleErr
+			}
+			logger.Info("billing reconciliation scheduled", "schedule", cfg.BillingReconcileSchedule)
+		}
+
 		cleanupCron.Start()
 		defer cleanupCron.Stop()
 
-		logger.Info("background workers enabled", "media_concurrency", cfg.MediaWorkerConcurrency)
-	}
-
-	// The Drive client is a read dependency of the public gallery, not only of
-	// the archive job: once an original has been archived, serving it is the
-	// only way a guest can still see that media. It is therefore built on
-	// every replica that has archiving configured, worker or not.
-	var driveReader *googledrive.Client
-	var archiveCron *cron.Cron
-	if cfg.DailyArchiveEnabled {
-		driveClient, driveErr := googledrive.New(ctx, cfg.GoogleDriveClientID, cfg.GoogleDriveSecret, cfg.GoogleDriveRefresh, cfg.GoogleDriveRootFolder)
-		if driveErr != nil {
-			return driveErr
+		// Retention runs daily. Off by default, it only logs which events are
+		// past their storage period; turning it on deletes their media.
+		retentionOpts := []retention.Option{
+			retention.WithEnforcement(cfg.RetentionEnforcementEnabled),
+			retention.WithGrace(cfg.RetentionGrace),
+			retention.WithLogger(logger),
 		}
-		driveReader = driveClient
-		if cfg.RunWorker {
-			archiveService := archive.New(database.NewArchiveRepository(db), storage, driveClient, cfg.DailyArchiveMinAge)
+		if driveReader != nil {
+			retentionOpts = append(retentionOpts, retention.WithArchive(driveReader))
+		}
+		retentionService := retention.NewService(retention.NewGormRepository(db), storage, retentionOpts...)
+		retentionCron := cron.New()
+		if _, scheduleErr := retentionCron.AddFunc(cfg.RetentionSchedule, func() {
+			jobCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if _, jobErr := retentionService.Run(jobCtx, cfg.RetentionBatch, false); jobErr != nil {
+				logger.Error("retention run failed", "error", jobErr)
+			}
+		}); scheduleErr != nil {
+			return scheduleErr
+		}
+		retentionCron.Start()
+		defer retentionCron.Stop()
+		logger.Info("retention job scheduled", "schedule", cfg.RetentionSchedule, "enforcement", cfg.RetentionEnforcementEnabled, "grace", cfg.RetentionGrace)
+
+		if driveReader != nil {
+			archiveService := archive.New(database.NewArchiveRepository(db), storage, driveReader, cfg.DailyArchiveMinAge)
 			archiveCron = cron.New()
 			if _, scheduleErr := archiveCron.AddFunc(cfg.DailyArchiveSchedule, func() {
 				jobCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -200,6 +320,8 @@ func run() error {
 			archiveCron.Start()
 			logger.Info("daily media archive enabled", "schedule", cfg.DailyArchiveSchedule)
 		}
+
+		logger.Info("background workers enabled", "media_concurrency", cfg.MediaWorkerConcurrency)
 	}
 	if archiveCron != nil {
 		defer archiveCron.Stop()
@@ -212,21 +334,37 @@ func run() error {
 	if driveReader != nil {
 		archiveReaders = append(archiveReaders, driveReader)
 	}
+	publicHandler := httpapi.NewPublicHandler(events, guests, uploads, analytics, archiveReaders...)
+	publicHandler.UsePlans(entitlements, cfg.EventMaxBytes)
+	var catalogHandler *catalog.Handler
+	if cfg.PlansCatalogEnabled {
+		catalogHandler = catalog.NewHandler(planCatalog, catalog.Rollout{
+			PricingUIEnabled:        cfg.PlansPricingUIEnabled,
+			ManualActivationEnabled: cfg.ManualPlanActivationEnabled,
+			EnforcementEnabled:      cfg.EntitlementEnforcementEnabled,
+			CheckoutEnabled:         cfg.BillingEnabled,
+		})
+	}
 	router := httpapi.NewRouter(httpapi.RouterConfig{
-		Logger:         logger,
-		Auth:           authn,
-		Limiter:        limiter,
-		AllowedOrigins: cors.Origins(cfg.CORSAllowedOrigins),
-		DatabaseReady:  sqlDB.PingContext,
-		Profiles:       profile.NewHandler(profiles),
-		Events:         eventHandler,
-		HostMedia:      httpapi.NewHostMediaHandler(events, profiles, uploads, archiveReaders...),
-		Insights:       httpapi.NewInsightsHandler(events, profiles, analytics),
-		Exports:        httpapi.NewExportHandler(events, profiles, exports),
-		LiveWall:       httpapi.NewLiveWallHandler(events, profiles, uploads, liveWall, realtimeHub),
-		Public:         httpapi.NewPublicHandler(events, guests, uploads, analytics, archiveReaders...),
-		QRLogo:         httpapi.NewQRLogoHandler(events, profiles, storage, cfg.PresignExpiry),
-		Stream:         streamHandler(cfg, events, profiles, realtimeHub, limiter),
+		Logger:                   logger,
+		Auth:                     authn,
+		Limiter:                  limiter,
+		RateLimitEventCreateIP:   cfg.RateLimitEventCreateIP,
+		RateLimitEventCreateHost: cfg.RateLimitEventCreateHost,
+		AllowedOrigins:           cors.Origins(cfg.CORSAllowedOrigins),
+		DatabaseReady:            sqlDB.PingContext,
+		Profiles:                 profile.NewHandler(profiles),
+		Events:                   eventHandler,
+		HostMedia:                httpapi.NewHostMediaHandler(events, profiles, uploads, archiveReaders...).UsePlans(entitlements),
+		Insights:                 httpapi.NewInsightsHandler(events, profiles, analytics).UsePlans(entitlements),
+		Exports:                  httpapi.NewExportHandler(events, profiles, exports).UsePlans(entitlements),
+		LiveWall:                 httpapi.NewLiveWallHandler(events, profiles, uploads, liveWall, realtimeHub).UsePlans(entitlements),
+		Public:                   publicHandler,
+		QRLogo:                   httpapi.NewQRLogoHandler(events, profiles, storage, cfg.PresignExpiry).UsePlans(entitlements),
+		Plans:                    httpapi.NewPlanHandler(events, profiles, entitlements),
+		Catalog:                  catalogHandler,
+		Billing:                  billingHandler,
+		Stream:                   streamHandler(cfg, events, profiles, realtimeHub, limiter),
 	})
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
